@@ -1,0 +1,6 @@
+{
+  "name": "Store Ledger & POS System",
+  "description": "Complete store ledger, point of sale, inventory management, user authentication, and activity tracking system.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
