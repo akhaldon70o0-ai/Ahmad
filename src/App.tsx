@@ -10,6 +10,7 @@ import { Navbar } from './components/Navbar';
 import { Sidebar } from './components/Sidebar';
 import { AuthModal } from './components/AuthModal';
 import { BarcodeScannerModal } from './components/BarcodeScannerModal';
+import { MasterLockScreen, isMasterUnlocked, lockMasterApp } from './components/MasterLockScreen';
 
 import { DashboardView } from './views/DashboardView';
 import { SalesPosView } from './views/SalesPosView';
@@ -34,6 +35,7 @@ import { BackupRestoreView } from './views/BackupRestoreView';
 import { MigrationView } from './views/MigrationView';
 
 function MainApp() {
+  const [isUnlocked, setIsUnlocked] = useState<boolean>(isMasterUnlocked());
   const [currentView, setCurrentView] = useState<AppView>('dashboard');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
@@ -75,6 +77,16 @@ function MainApp() {
     setCurrentView('bundles');
   };
 
+  const handleLockApp = () => {
+    lockMasterApp();
+    setIsUnlocked(false);
+  };
+
+  // If not unlocked with password AK7.0O0, render the master lock screen
+  if (!isUnlocked) {
+    return <MasterLockScreen onUnlock={() => setIsUnlocked(true)} />;
+  }
+
   return (
     <div className="flex h-screen w-full bg-slate-50 font-sans text-slate-900 overflow-hidden selection:bg-blue-500 selection:text-white">
       {/* Navigation Sidebar */}
@@ -98,6 +110,7 @@ function MainApp() {
           onOpenScanner={() => setIsScannerOpen(true)}
           onToggleMobileMenu={() => setMobileMenuOpen(!mobileMenuOpen)}
           onSelectView={(v) => setCurrentView(v as AppView)}
+          onLockApp={handleLockApp}
         />
 
         <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
