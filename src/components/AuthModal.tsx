@@ -255,9 +255,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           {activeTab === 'login' && (
             <form onSubmit={handleLoginSubmit} className="space-y-4">
               <div>
-                <h4 className="text-sm font-bold text-slate-900">Sign in to your account</h4>
+                <div className="flex items-center justify-between">
+                  <h4 className="text-sm font-bold text-slate-900">Sign in to your account</h4>
+                  <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                    Multi-Device Cloud Synced
+                  </span>
+                </div>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Enter your email or username to access your workspace.
+                  Enter your email or username to access your workspace from any phone, tablet, or PC.
                 </p>
               </div>
 

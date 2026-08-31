@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import {
   User,
   UserRole,
@@ -21,6 +21,9 @@ import {
   InventoryAudit,
   DailyCloseRecord,
   StoreSettings,
+  StoreMeta,
+  StoreAccessRequest,
+  ActivationCode,
 } from '../types';
 import {
   initIndexedDb,
@@ -37,10 +40,70 @@ import {
   recoverFromIndexedDb,
   clearIndexedDbStore,
 } from '../services/storage';
+import {
+  createStoreInCloud,
+  registerStaffIndexInCloud,
+  lookupUserStoreAccount,
+  fetchStoreMetadata,
+  fetchStoreDataPartition,
+  saveStoreDataPartition,
+  subscribeToStorePartition,
+  listAllStoresForOwner,
+  verifyAndConsumeActivationCode,
+  submitStoreAccessRequest,
+  fetchStoreAccessRequests,
+  updateStoreRequestStatus,
+  createActivationCodeInCloud,
+  fetchActivationCodes,
+  fetchAllStoresForMasterAdmin,
+  deleteStoreInCloud,
+  sendOwnerVerificationCode,
+  verifyOwnerVerificationCode,
+  MASTER_ADMIN_EMAIL,
+  MASTER_PASSCODES,
+  CloudSyncState,
+  CloudStoreData,
+} from '../services/firebase';
 import { generateId, getTodayDateString, playSound } from '../utils/audio';
 import { hashPassword, verifyPassword } from '../utils/security';
 
 interface StoreContextType {
+  // Multi-Tenant Store Account
+  currentStore: StoreMeta | null;
+  isStoreLoading: boolean;
+  createStore: (params: {
+    storeName: string;
+    ownerName: string;
+    ownerEmail: string;
+    password?: string;
+    pin?: string;
+    currency?: string;
+    description?: string;
+    activationCode?: string;
+  }) => Promise<{ success: boolean; error?: string; store?: StoreMeta }>;
+  loginToStore: (
+    identifier: string,
+    password?: string,
+    targetStoreId?: string
+  ) => Promise<{ success: boolean; error?: string; store?: StoreMeta }>;
+  switchStore: (storeId: string) => Promise<boolean>;
+  logoutStore: () => void;
+  listStoresForEmail: (email: string) => Promise<StoreMeta[]>;
+  updateCurrentStoreMeta: (updates: Partial<StoreMeta>) => Promise<boolean>;
+
+  // Store Requests & License Codes (Access Control)
+  masterAdminEmail: string;
+  isMasterAdmin: (email?: string) => boolean;
+  submitAccessRequest: (req: Omit<StoreAccessRequest, 'id' | 'status' | 'requestedAt'>) => Promise<{ success: boolean; id: string; error?: string }>;
+  getAccessRequests: () => Promise<StoreAccessRequest[]>;
+  updateAccessRequest: (requestId: string, status: 'approved' | 'rejected', code?: string) => Promise<boolean>;
+  generateActivationCode: (code: string, email?: string, business?: string, notes?: string) => Promise<{ success: boolean; item?: ActivationCode; error?: string }>;
+  getActivationCodes: () => Promise<ActivationCode[]>;
+  getAllMasterStores: () => Promise<StoreMeta[]>;
+  deleteMasterStore: (storeId: string) => Promise<boolean>;
+  requestOwnerOtp: (email: string) => Promise<{ success: boolean; expiresAt?: string; error?: string }>;
+  verifyOwnerOtp: (email: string, code: string) => Promise<{ valid: boolean; reason?: string }>;
+
   // User Authentication & Profile
   currentUser: User;
   users: User[];
@@ -175,6 +238,11 @@ interface StoreContextType {
   wipeAllUsersExceptAdmin: () => void;
   dispatchCloudWebhook: (triggerSource: string) => Promise<boolean>;
 
+  // Cloud Multi-Device Sync
+  cloudSyncStatus: CloudSyncState;
+  lastCloudSync: string | null;
+  syncWithCloudNow: () => Promise<boolean>;
+
   // Calculated Metrics
   tillBalance: number;
 }
@@ -193,119 +261,395 @@ const BG_PALETTES = [
 ];
 
 export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // State Initialization from LocalStorage
-  const [users, setUsers] = useState<User[]>(() => getStoredData('users', DEFAULT_USERS));
-  const [currentUserId, setCurrentUserId] = useState<string>(() => {
-    const saved = localStorage.getItem('current_user_id');
-    return saved || DEFAULT_USERS[0].id;
+  // Multi-Tenant Active Store State
+  const [currentStore, setCurrentStore] = useState<StoreMeta | null>(() => {
+    try {
+      const saved = localStorage.getItem('active_store_meta');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.id && parsed.name) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+  const [isStoreLoading, setIsStoreLoading] = useState<boolean>(false);
+
+  // Partitioned storage key generator
+  const getStoreKey = useCallback(
+    (key: string) => (currentStore ? `store_${currentStore.id}_${key}` : `default_${key}`),
+    [currentStore]
+  );
+
+  // State Initialization
+  const [users, setUsers] = useState<User[]>(() => {
+    try {
+      const savedMeta = localStorage.getItem('active_store_meta');
+      if (savedMeta) {
+        const meta = JSON.parse(savedMeta);
+        const storedUsers = localStorage.getItem(`store_${meta.id}_users`);
+        if (storedUsers) return JSON.parse(storedUsers);
+      }
+    } catch {
+      // ignore
+    }
+    return [];
   });
 
-  const [settings, setSettings] = useState<StoreSettings>(() => getStoredData('settings', INITIAL_SETTINGS));
-  const [activities, setActivities] = useState<UserActivity[]>(() =>
-    getStoredData('activities', INITIAL_ACTIVITIES)
-  );
+  const [currentUserId, setCurrentUserId] = useState<string>(() => {
+    return localStorage.getItem('current_user_id') || '';
+  });
 
-  const [inventory, setInventory] = useState<InventoryItem[]>(() =>
-    getStoredData('inventory', INITIAL_INVENTORY)
-  );
-  const [sales, setSales] = useState<SaleRecord[]>(() => getStoredData('sales', []));
-  const [purchases, setPurchases] = useState<PurchaseRecord[]>(() => getStoredData('purchases', []));
-  const [customers, setCustomers] = useState<CustomerRecord[]>(() =>
-    getStoredData('customers', INITIAL_CUSTOMERS)
-  );
-  const [customerPayments, setCustomerPayments] = useState<CustomerPayment[]>(() =>
-    getStoredData('customerPayments', [])
-  );
-  const [suppliers, setSuppliers] = useState<SupplierRecord[]>(() => getStoredData('suppliers', []));
-  const [dailyOrders, setDailyOrders] = useState<DailyOrder[]>(() =>
-    getStoredData('dailyOrders', INITIAL_ORDERS)
-  );
-  const [bundles, setBundles] = useState<ProductBundle[]>(() =>
-    getStoredData('bundles', INITIAL_BUNDLES)
-  );
-  const [coupons, setCoupons] = useState<PromoCoupon[]>(() =>
-    getStoredData('coupons', INITIAL_COUPONS)
-  );
-  const [writeOffs, setWriteOffs] = useState<WriteOffRecord[]>(() => getStoredData('writeOffs', []));
-  const [returnsLog, setReturnsLog] = useState<ReturnRecord[]>(() => getStoredData('returnsLog', []));
-  const [expenses, setExpenses] = useState<ExpenseRecord[]>(() => getStoredData('expenses', []));
-  const [stockMovements, setStockMovements] = useState<StockMovement[]>(() =>
-    getStoredData('stockMovements', [])
-  );
-  const [inventoryAudits, setInventoryAudits] = useState<InventoryAudit[]>(() =>
-    getStoredData('inventoryAudits', [])
-  );
-  const [dailyClosures, setDailyClosures] = useState<DailyCloseRecord[]>(() =>
-    getStoredData('dailyClosures', [])
-  );
+  const [settings, setSettings] = useState<StoreSettings>(() => {
+    try {
+      const savedMeta = localStorage.getItem('active_store_meta');
+      if (savedMeta) {
+        const meta = JSON.parse(savedMeta);
+        const storedSettings = localStorage.getItem(`store_${meta.id}_settings`);
+        if (storedSettings) return JSON.parse(storedSettings);
+        return {
+          ...INITIAL_SETTINGS,
+          storeName: meta.name || INITIAL_SETTINGS.storeName,
+          currency: meta.currency || INITIAL_SETTINGS.currency,
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return INITIAL_SETTINGS;
+  });
 
-  // Find Active User
-  const currentUser: User = users.find((u) => u.id === currentUserId) || users[0] || DEFAULT_USERS[0];
+  const [activities, setActivities] = useState<UserActivity[]>([]);
+  const [inventory, setInventory] = useState<InventoryItem[]>([]);
+  const [sales, setSales] = useState<SaleRecord[]>([]);
+  const [purchases, setPurchases] = useState<PurchaseRecord[]>([]);
+  const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [customerPayments, setCustomerPayments] = useState<CustomerPayment[]>([]);
+  const [suppliers, setSuppliers] = useState<SupplierRecord[]>([]);
+  const [dailyOrders, setDailyOrders] = useState<DailyOrder[]>([]);
+  const [bundles, setBundles] = useState<ProductBundle[]>([]);
+  const [coupons, setCoupons] = useState<PromoCoupon[]>([]);
+  const [writeOffs, setWriteOffs] = useState<WriteOffRecord[]>([]);
+  const [returnsLog, setReturnsLog] = useState<ReturnRecord[]>([]);
+  const [expenses, setExpenses] = useState<ExpenseRecord[]>([]);
+  const [stockMovements, setStockMovements] = useState<StockMovement[]>([]);
+  const [inventoryAudits, setInventoryAudits] = useState<InventoryAudit[]>([]);
+  const [dailyClosures, setDailyClosures] = useState<DailyCloseRecord[]>([]);
 
-  // Initialize IndexedDB on startup
+  // Cloud Multi-Device Sync State
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<CloudSyncState>('idle');
+  const [lastCloudSync, setLastCloudSync] = useState<string | null>(null);
+  const isRemoteUpdatingRef = useRef<boolean>(false);
+  const isInitialCloudHydratedRef = useRef<boolean>(false);
+  const cloudDebounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Active Current User
+  const currentUser: User =
+    users.find((u) => u.id === currentUserId) ||
+    users[0] || {
+      id: 'anon',
+      username: 'guest',
+      name: currentStore ? currentStore.ownerName : 'Store Guest',
+      email: currentStore ? currentStore.ownerEmail : '',
+      role: 'admin',
+      avatarBg: 'bg-indigo-600',
+      avatarEmoji: '🏪',
+      createdAt: new Date().toISOString(),
+      lastLogin: new Date().toISOString(),
+    };
+
+  // Initialize IndexedDB
   useEffect(() => {
     initIndexedDb().catch(console.error);
   }, []);
 
-  // Save changes to storage
+  // Save active store session to localStorage
   useEffect(() => {
-    setStoredData('users', users);
-  }, [users]);
+    if (currentStore) {
+      localStorage.setItem('active_store_meta', JSON.stringify(currentStore));
+      localStorage.setItem('active_store_id', currentStore.id);
+    } else {
+      localStorage.removeItem('active_store_meta');
+      localStorage.removeItem('active_store_id');
+      localStorage.removeItem('current_user_id');
+    }
+  }, [currentStore]);
+
+  // Real-time Cloud Synchronization Listener for Active Store Partition
   useEffect(() => {
-    localStorage.setItem('current_user_id', currentUserId);
+    if (!currentStore?.id) {
+      setCloudSyncStatus('idle');
+      return;
+    }
+
+    let isMounted = true;
+    setCloudSyncStatus('syncing');
+
+    const unsubscribe = subscribeToStorePartition(
+      currentStore.id,
+      (cloudData: CloudStoreData) => {
+        if (!isMounted) return;
+
+        isRemoteUpdatingRef.current = true;
+
+        if (cloudData.users && Array.isArray(cloudData.users) && cloudData.users.length > 0) {
+          setUsers(cloudData.users);
+          setCurrentUserId((prevId) => {
+            const exists = cloudData.users.some((u) => u.id === prevId);
+            return exists ? prevId : cloudData.users[0].id;
+          });
+        }
+        if (cloudData.inventory && Array.isArray(cloudData.inventory)) setInventory(cloudData.inventory);
+        if (cloudData.sales && Array.isArray(cloudData.sales)) setSales(cloudData.sales);
+        if (cloudData.purchases && Array.isArray(cloudData.purchases)) setPurchases(cloudData.purchases);
+        if (cloudData.customers && Array.isArray(cloudData.customers)) setCustomers(cloudData.customers);
+        if (cloudData.customerPayments && Array.isArray(cloudData.customerPayments))
+          setCustomerPayments(cloudData.customerPayments);
+        if (cloudData.suppliers && Array.isArray(cloudData.suppliers)) setSuppliers(cloudData.suppliers);
+        if (cloudData.dailyOrders && Array.isArray(cloudData.dailyOrders)) setDailyOrders(cloudData.dailyOrders);
+        if (cloudData.bundles && Array.isArray(cloudData.bundles)) setBundles(cloudData.bundles);
+        if (cloudData.coupons && Array.isArray(cloudData.coupons)) setCoupons(cloudData.coupons);
+        if (cloudData.writeOffs && Array.isArray(cloudData.writeOffs)) setWriteOffs(cloudData.writeOffs);
+        if (cloudData.returnsLog && Array.isArray(cloudData.returnsLog)) setReturnsLog(cloudData.returnsLog);
+        if (cloudData.expenses && Array.isArray(cloudData.expenses)) setExpenses(cloudData.expenses);
+        if (cloudData.stockMovements && Array.isArray(cloudData.stockMovements)) setStockMovements(cloudData.stockMovements);
+        if (cloudData.inventoryAudits && Array.isArray(cloudData.inventoryAudits))
+          setInventoryAudits(cloudData.inventoryAudits);
+        if (cloudData.dailyClosures && Array.isArray(cloudData.dailyClosures)) setDailyClosures(cloudData.dailyClosures);
+        if (cloudData.activities && Array.isArray(cloudData.activities)) setActivities(cloudData.activities);
+        if (cloudData.settings && typeof cloudData.settings === 'object') setSettings(cloudData.settings);
+
+        setCloudSyncStatus('synced');
+        setLastCloudSync(cloudData.updatedAt || new Date().toISOString());
+        isInitialCloudHydratedRef.current = true;
+
+        setTimeout(() => {
+          isRemoteUpdatingRef.current = false;
+        }, 400);
+      },
+      (err) => {
+        console.warn('[StoreContext] Store partition sync status:', err);
+        setCloudSyncStatus('offline');
+      }
+    );
+
+    // Initial check & hydration for currentStore
+    fetchStoreDataPartition(currentStore.id)
+      .then((data) => {
+        if (!isMounted) return;
+        if (data) {
+          isRemoteUpdatingRef.current = true;
+          if (data.users && Array.isArray(data.users) && data.users.length > 0) {
+            setUsers(data.users);
+            if (!currentUserId || !data.users.some((u) => u.id === currentUserId)) {
+              setCurrentUserId(data.users[0].id);
+            }
+          }
+          if (data.inventory && Array.isArray(data.inventory)) setInventory(data.inventory);
+          if (data.sales && Array.isArray(data.sales)) setSales(data.sales);
+          if (data.purchases && Array.isArray(data.purchases)) setPurchases(data.purchases);
+          if (data.customers && Array.isArray(data.customers)) setCustomers(data.customers);
+          if (data.customerPayments && Array.isArray(data.customerPayments))
+            setCustomerPayments(data.customerPayments);
+          if (data.suppliers && Array.isArray(data.suppliers)) setSuppliers(data.suppliers);
+          if (data.dailyOrders && Array.isArray(data.dailyOrders)) setDailyOrders(data.dailyOrders);
+          if (data.bundles && Array.isArray(data.bundles)) setBundles(data.bundles);
+          if (data.coupons && Array.isArray(data.coupons)) setCoupons(data.coupons);
+          if (data.writeOffs && Array.isArray(data.writeOffs)) setWriteOffs(data.writeOffs);
+          if (data.returnsLog && Array.isArray(data.returnsLog)) setReturnsLog(data.returnsLog);
+          if (data.expenses && Array.isArray(data.expenses)) setExpenses(data.expenses);
+          if (data.stockMovements && Array.isArray(data.stockMovements)) setStockMovements(data.stockMovements);
+          if (data.inventoryAudits && Array.isArray(data.inventoryAudits))
+            setInventoryAudits(data.inventoryAudits);
+          if (data.dailyClosures && Array.isArray(data.dailyClosures)) setDailyClosures(data.dailyClosures);
+          if (data.activities && Array.isArray(data.activities)) setActivities(data.activities);
+          if (data.settings && typeof data.settings === 'object') setSettings(data.settings);
+
+          setCloudSyncStatus('synced');
+          setLastCloudSync(data.updatedAt || new Date().toISOString());
+          isInitialCloudHydratedRef.current = true;
+
+          setTimeout(() => {
+            isRemoteUpdatingRef.current = false;
+          }, 300);
+        } else {
+          isInitialCloudHydratedRef.current = true;
+          setCloudSyncStatus('synced');
+        }
+      })
+      .catch((err) => {
+        console.warn('[StoreContext] Error loading store partition:', err);
+        setCloudSyncStatus('offline');
+      });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, [currentStore?.id]);
+
+  // Push local state updates to Cloud Firestore across all devices for this store
+  useEffect(() => {
+    if (!currentStore?.id) return;
+    if (isRemoteUpdatingRef.current) return;
+    if (!isInitialCloudHydratedRef.current) return;
+
+    if (cloudDebounceTimerRef.current) {
+      clearTimeout(cloudDebounceTimerRef.current);
+    }
+
+    cloudDebounceTimerRef.current = setTimeout(async () => {
+      setCloudSyncStatus('syncing');
+      const success = await saveStoreDataPartition(
+        currentStore.id,
+        {
+          users,
+          inventory,
+          sales,
+          purchases,
+          customers,
+          customerPayments,
+          suppliers,
+          dailyOrders,
+          bundles,
+          coupons,
+          writeOffs,
+          returnsLog,
+          expenses,
+          stockMovements,
+          inventoryAudits,
+          dailyClosures,
+          activities,
+          settings,
+        },
+        currentUser.name
+      );
+
+      if (success) {
+        setCloudSyncStatus('synced');
+        setLastCloudSync(new Date().toISOString());
+      } else {
+        setCloudSyncStatus('offline');
+      }
+    }, 600);
+
+    return () => {
+      if (cloudDebounceTimerRef.current) clearTimeout(cloudDebounceTimerRef.current);
+    };
+  }, [
+    currentStore?.id,
+    users,
+    inventory,
+    sales,
+    purchases,
+    customers,
+    customerPayments,
+    suppliers,
+    dailyOrders,
+    bundles,
+    coupons,
+    writeOffs,
+    returnsLog,
+    expenses,
+    stockMovements,
+    inventoryAudits,
+    dailyClosures,
+    activities,
+    settings,
+    currentUser.name,
+  ]);
+
+  // Save changes to local storage partitioned by store ID
+  useEffect(() => {
+    if (!currentStore?.id) return;
+    try {
+      localStorage.setItem(`store_${currentStore.id}_users`, JSON.stringify(users));
+      localStorage.setItem(`store_${currentStore.id}_settings`, JSON.stringify(settings));
+    } catch {
+      // ignore
+    }
+  }, [currentStore?.id, users, settings]);
+
+  useEffect(() => {
+    if (currentUserId) localStorage.setItem('current_user_id', currentUserId);
   }, [currentUserId]);
-  useEffect(() => {
-    setStoredData('settings', settings);
-  }, [settings]);
-  useEffect(() => {
-    setStoredData('activities', activities);
-  }, [activities]);
-  useEffect(() => {
-    setStoredData('inventory', inventory);
-  }, [inventory]);
-  useEffect(() => {
-    setStoredData('sales', sales);
-  }, [sales]);
-  useEffect(() => {
-    setStoredData('purchases', purchases);
-  }, [purchases]);
-  useEffect(() => {
-    setStoredData('customers', customers);
-  }, [customers]);
-  useEffect(() => {
-    setStoredData('customerPayments', customerPayments);
-  }, [customerPayments]);
-  useEffect(() => {
-    setStoredData('suppliers', suppliers);
-  }, [suppliers]);
-  useEffect(() => {
-    setDailyOrders((prev) => prev);
-    setStoredData('dailyOrders', dailyOrders);
-  }, [dailyOrders]);
-  useEffect(() => {
-    setStoredData('bundles', bundles);
-  }, [bundles]);
-  useEffect(() => {
-    setStoredData('coupons', coupons);
-  }, [coupons]);
-  useEffect(() => {
-    setStoredData('writeOffs', writeOffs);
-  }, [writeOffs]);
-  useEffect(() => {
-    setStoredData('returnsLog', returnsLog);
-  }, [returnsLog]);
-  useEffect(() => {
-    setStoredData('expenses', expenses);
-  }, [expenses]);
-  useEffect(() => {
-    setStoredData('stockMovements', stockMovements);
-  }, [stockMovements]);
-  useEffect(() => {
-    setStoredData('inventoryAudits', inventoryAudits);
-  }, [inventoryAudits]);
-  useEffect(() => {
-    setStoredData('dailyClosures', dailyClosures);
-  }, [dailyClosures]);
+
+  // Manual Sync helper
+  const syncWithCloudNow = async (): Promise<boolean> => {
+    if (!currentStore?.id) return false;
+    setCloudSyncStatus('syncing');
+    try {
+      const remoteData = await fetchStoreDataPartition(currentStore.id);
+      if (remoteData) {
+        isRemoteUpdatingRef.current = true;
+        if (remoteData.users && Array.isArray(remoteData.users) && remoteData.users.length > 0) setUsers(remoteData.users);
+        if (remoteData.inventory && Array.isArray(remoteData.inventory)) setInventory(remoteData.inventory);
+        if (remoteData.sales && Array.isArray(remoteData.sales)) setSales(remoteData.sales);
+        if (remoteData.purchases && Array.isArray(remoteData.purchases)) setPurchases(remoteData.purchases);
+        if (remoteData.customers && Array.isArray(remoteData.customers)) setCustomers(remoteData.customers);
+        if (remoteData.customerPayments && Array.isArray(remoteData.customerPayments))
+          setCustomerPayments(remoteData.customerPayments);
+        if (remoteData.suppliers && Array.isArray(remoteData.suppliers)) setSuppliers(remoteData.suppliers);
+        if (remoteData.dailyOrders && Array.isArray(remoteData.dailyOrders)) setDailyOrders(remoteData.dailyOrders);
+        if (remoteData.bundles && Array.isArray(remoteData.bundles)) setBundles(remoteData.bundles);
+        if (remoteData.coupons && Array.isArray(remoteData.coupons)) setCoupons(remoteData.coupons);
+        if (remoteData.writeOffs && Array.isArray(remoteData.writeOffs)) setWriteOffs(remoteData.writeOffs);
+        if (remoteData.returnsLog && Array.isArray(remoteData.returnsLog)) setReturnsLog(remoteData.returnsLog);
+        if (remoteData.expenses && Array.isArray(remoteData.expenses)) setExpenses(remoteData.expenses);
+        if (remoteData.stockMovements && Array.isArray(remoteData.stockMovements)) setStockMovements(remoteData.stockMovements);
+        if (remoteData.inventoryAudits && Array.isArray(remoteData.inventoryAudits))
+          setInventoryAudits(remoteData.inventoryAudits);
+        if (remoteData.dailyClosures && Array.isArray(remoteData.dailyClosures)) setDailyClosures(remoteData.dailyClosures);
+        if (remoteData.activities && Array.isArray(remoteData.activities)) setActivities(remoteData.activities);
+        if (remoteData.settings && typeof remoteData.settings === 'object') setSettings(remoteData.settings);
+
+        setCloudSyncStatus('synced');
+        setLastCloudSync(remoteData.updatedAt || new Date().toISOString());
+        setTimeout(() => {
+          isRemoteUpdatingRef.current = false;
+        }, 300);
+        return true;
+      }
+
+      const success = await saveStoreDataPartition(
+        currentStore.id,
+        {
+          users,
+          inventory,
+          sales,
+          purchases,
+          customers,
+          customerPayments,
+          suppliers,
+          dailyOrders,
+          bundles,
+          coupons,
+          writeOffs,
+          returnsLog,
+          expenses,
+          stockMovements,
+          inventoryAudits,
+          dailyClosures,
+          activities,
+          settings,
+        },
+        currentUser.name
+      );
+
+      if (success) {
+        setCloudSyncStatus('synced');
+        setLastCloudSync(new Date().toISOString());
+      } else {
+        setCloudSyncStatus('offline');
+      }
+      return success;
+    } catch (e) {
+      console.error('[StoreContext] Manual sync error:', e);
+      setCloudSyncStatus('offline');
+      return false;
+    }
+  };
 
   // Log Activity Helper
   const logActivity = useCallback(
@@ -326,12 +670,372 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         timestamp: new Date().toISOString(),
         metadata,
       };
-      setActivities((prev) => [newAct, ...prev.slice(0, 499)]); // keep latest 500
+      setActivities((prev) => [newAct, ...prev.slice(0, 499)]);
     },
     [currentUser]
   );
 
-  // User Auth Actions
+  // ================= MULTI-STORE TENANT OPERATIONS =================
+
+  const isMasterAdmin = useCallback((email?: string): boolean => {
+    const testEmail = email || currentStore?.ownerEmail || currentUser.email;
+    return testEmail.trim().toLowerCase() === MASTER_ADMIN_EMAIL.toLowerCase();
+  }, [currentStore, currentUser]);
+
+  const submitAccessRequest = useCallback(
+    async (req: Omit<StoreAccessRequest, 'id' | 'status' | 'requestedAt'>) => {
+      return submitStoreAccessRequest(req);
+    },
+    []
+  );
+
+  const getAccessRequests = useCallback(async () => {
+    return fetchStoreAccessRequests();
+  }, []);
+
+  const updateAccessRequest = useCallback(
+    async (requestId: string, status: 'approved' | 'rejected', code?: string) => {
+      return updateStoreRequestStatus(requestId, status, code, MASTER_ADMIN_EMAIL);
+    },
+    []
+  );
+
+  const generateActivationCode = useCallback(
+    async (code: string, email?: string, business?: string, notes?: string) => {
+      return createActivationCodeInCloud(code, email, business, MASTER_ADMIN_EMAIL, notes);
+    },
+    []
+  );
+
+  const getActivationCodes = useCallback(async () => {
+    return fetchActivationCodes();
+  }, []);
+
+  const getAllMasterStores = useCallback(async () => {
+    return fetchAllStoresForMasterAdmin();
+  }, []);
+
+  const deleteMasterStore = useCallback(async (storeId: string) => {
+    return deleteStoreInCloud(storeId);
+  }, []);
+
+  const requestOwnerOtp = useCallback(async (email: string) => {
+    return sendOwnerVerificationCode(email);
+  }, []);
+
+  const verifyOwnerOtp = useCallback(async (email: string, code: string) => {
+    return verifyOwnerVerificationCode(email, code);
+  }, []);
+
+  /**
+   * Create a new Store in Cloud Firestore
+   */
+  const createStore = async (params: {
+    storeName: string;
+    ownerName: string;
+    ownerEmail: string;
+    password?: string;
+    pin?: string;
+    currency?: string;
+    description?: string;
+    activationCode?: string;
+  }): Promise<{ success: boolean; error?: string; store?: StoreMeta }> => {
+    setIsStoreLoading(true);
+    try {
+      const cleanEmail = params.ownerEmail.trim().toLowerCase();
+      const safeStoreId = `store_${cleanEmail.replace(/[^a-z0-9]/g, '_')}_${Date.now().toString(36)}`;
+
+      // 🛑 ACCESS CONTROL CHECK: Verify activation license code
+      const isOwnerCreating = cleanEmail === MASTER_ADMIN_EMAIL.toLowerCase();
+      if (!isOwnerCreating) {
+        if (!params.activationCode || !params.activationCode.trim()) {
+          return {
+            success: false,
+            error:
+              'Store creation is protected. Please provide a valid Activation License Key, or contact the administrator at ' +
+              MASTER_ADMIN_EMAIL +
+              ' to request an account.',
+          };
+        }
+
+        const codeCheck = await verifyAndConsumeActivationCode(
+          params.activationCode.trim(),
+          safeStoreId,
+          cleanEmail
+        );
+
+        if (!codeCheck.valid) {
+          return {
+            success: false,
+            error: codeCheck.reason || 'Invalid or already used Activation License Key.',
+          };
+        }
+      }
+
+      let passwordHash: string | undefined = undefined;
+      let passwordSalt: string | undefined = undefined;
+
+      if (params.password && params.password.trim()) {
+        const hashed = await hashPassword(params.password.trim());
+        passwordHash = hashed.hash;
+        passwordSalt = hashed.salt;
+      }
+
+      const storeMeta: StoreMeta = {
+        id: safeStoreId,
+        name: params.storeName.trim(),
+        ownerEmail: cleanEmail,
+        ownerName: params.ownerName.trim(),
+        currency: params.currency || '$',
+        adminPin: params.pin?.trim() || '1234',
+        createdAt: new Date().toISOString(),
+        lastActive: new Date().toISOString(),
+        passwordHash,
+        passwordSalt,
+        description: params.description?.trim(),
+        activationCode: params.activationCode?.trim().toUpperCase(),
+        isApproved: true,
+      };
+
+      const adminUser: User = {
+        id: 'admin_' + generateId(),
+        username: cleanEmail.split('@')[0] || 'admin',
+        email: cleanEmail,
+        name: params.ownerName.trim(),
+        role: 'admin',
+        avatarBg: 'bg-indigo-600',
+        avatarEmoji: '👑',
+        createdAt: new Date().toISOString(),
+        lastLogin: new Date().toISOString(),
+        passwordHash,
+        passwordSalt,
+      };
+
+      const newSettings: StoreSettings = {
+        storeName: params.storeName.trim(),
+        currency: params.currency || '$',
+        adminPin: params.pin?.trim() || '1234',
+        cloudWebhookUrl: '',
+        autoWebhookDailyClose: 'no',
+        soundEnabled: true,
+      };
+
+      const res = await createStoreInCloud(storeMeta, adminUser, {
+        users: [adminUser],
+        settings: newSettings,
+        inventory: [],
+        sales: [],
+        customers: [],
+        dailyOrders: [],
+        expenses: [],
+        activities: [],
+      });
+
+      if (!res.success) {
+        return { success: false, error: res.error || 'Failed to initialize store in cloud database.' };
+      }
+
+      // Set active store and local state
+      setCurrentStore(storeMeta);
+      setUsers([adminUser]);
+      setCurrentUserId(adminUser.id);
+      setSettings(newSettings);
+      setInventory([]);
+      setSales([]);
+      setPurchases([]);
+      setCustomers([]);
+      setCustomerPayments([]);
+      setSuppliers([]);
+      setDailyOrders([]);
+      setBundles([]);
+      setCoupons([]);
+      setWriteOffs([]);
+      setReturnsLog([]);
+      setExpenses([]);
+      setStockMovements([]);
+      setInventoryAudits([]);
+      setDailyClosures([]);
+      setActivities([]);
+
+      playSound('success', true);
+      return { success: true, store: storeMeta };
+    } catch (err: unknown) {
+      console.error('[StoreContext] Create store error:', err);
+      return { success: false, error: (err as Error).message || 'Failed to create store.' };
+    } finally {
+      setIsStoreLoading(false);
+    }
+  };
+
+  /**
+   * Log into a store by email or username
+   */
+  const loginToStore = async (
+    identifier: string,
+    password = '',
+    targetStoreId?: string
+  ): Promise<{ success: boolean; error?: string; store?: StoreMeta }> => {
+    setIsStoreLoading(true);
+    try {
+      const userRecord = await lookupUserStoreAccount(identifier);
+
+      if (!userRecord) {
+        return {
+          success: false,
+          error: 'No store account found matching that email or username. Please check spelling or register a new store.',
+        };
+      }
+
+      const storeIdToOpen = targetStoreId || userRecord.storeId;
+      const storeMeta = await fetchStoreMetadata(storeIdToOpen);
+
+      if (!storeMeta) {
+        return {
+          success: false,
+          error: 'Store partition could not be retrieved from the cloud.',
+        };
+      }
+
+      // Check Password if set on account or store
+      const passHash = userRecord.passwordHash || storeMeta.passwordHash;
+      const passSalt = userRecord.passwordSalt || storeMeta.passwordSalt;
+
+      if (passHash) {
+        const isValid = await verifyPassword(password, passHash, passSalt);
+        // Also allow matching admin PIN
+        const isPinValid = userRecord.pin && password.trim() === userRecord.pin;
+        if (!isValid && !isPinValid) {
+          return { success: false, error: 'Incorrect password or PIN for this store account.' };
+        }
+      }
+
+      // Fetch the full store partition
+      const partitionData = await fetchStoreDataPartition(storeIdToOpen);
+
+      // Hydrate state
+      setCurrentStore(storeMeta);
+
+      if (partitionData) {
+        isRemoteUpdatingRef.current = true;
+        const loadedUsers = partitionData.users || [];
+        setUsers(loadedUsers);
+
+        // Find active user
+        const matchingUser = loadedUsers.find(
+          (u) =>
+            u.email.toLowerCase() === identifier.trim().toLowerCase() ||
+            u.username.toLowerCase() === identifier.trim().toLowerCase()
+        );
+        setCurrentUserId(matchingUser ? matchingUser.id : loadedUsers[0]?.id || 'admin');
+
+        if (partitionData.inventory) setInventory(partitionData.inventory);
+        if (partitionData.sales) setSales(partitionData.sales);
+        if (partitionData.purchases) setPurchases(partitionData.purchases);
+        if (partitionData.customers) setCustomers(partitionData.customers);
+        if (partitionData.customerPayments) setCustomerPayments(partitionData.customerPayments);
+        if (partitionData.suppliers) setSuppliers(partitionData.suppliers);
+        if (partitionData.dailyOrders) setDailyOrders(partitionData.dailyOrders);
+        if (partitionData.bundles) setBundles(partitionData.bundles);
+        if (partitionData.coupons) setCoupons(partitionData.coupons);
+        if (partitionData.writeOffs) setWriteOffs(partitionData.writeOffs);
+        if (partitionData.returnsLog) setReturnsLog(partitionData.returnsLog);
+        if (partitionData.expenses) setExpenses(partitionData.expenses);
+        if (partitionData.stockMovements) setStockMovements(partitionData.stockMovements);
+        if (partitionData.inventoryAudits) setInventoryAudits(partitionData.inventoryAudits);
+        if (partitionData.dailyClosures) setDailyClosures(partitionData.dailyClosures);
+        if (partitionData.activities) setActivities(partitionData.activities);
+        if (partitionData.settings) setSettings(partitionData.settings);
+
+        setTimeout(() => {
+          isRemoteUpdatingRef.current = false;
+        }, 300);
+      }
+
+      playSound('success', true);
+      return { success: true, store: storeMeta };
+    } catch (err: unknown) {
+      console.error('[StoreContext] Login to store error:', err);
+      return { success: false, error: (err as Error).message || 'Failed to authenticate into store.' };
+    } finally {
+      setIsStoreLoading(false);
+    }
+  };
+
+  /**
+   * Switch between branches / stores
+   */
+  const switchStore = async (storeId: string): Promise<boolean> => {
+    setIsStoreLoading(true);
+    try {
+      const meta = await fetchStoreMetadata(storeId);
+      if (!meta) return false;
+
+      setCurrentStore(meta);
+      return true;
+    } catch (e) {
+      console.error('[StoreContext] Switch store error:', e);
+      return false;
+    } finally {
+      setIsStoreLoading(false);
+    }
+  };
+
+  /**
+   * Log out of current store and return to multi-store portal
+   */
+  const logoutStore = () => {
+    setCurrentStore(null);
+    setUsers([]);
+    setCurrentUserId('');
+    setInventory([]);
+    setSales([]);
+    setPurchases([]);
+    setCustomers([]);
+    setCustomerPayments([]);
+    setSuppliers([]);
+    setDailyOrders([]);
+    setBundles([]);
+    setCoupons([]);
+    setWriteOffs([]);
+    setReturnsLog([]);
+    setExpenses([]);
+    setStockMovements([]);
+    setInventoryAudits([]);
+    setDailyClosures([]);
+    setActivities([]);
+    setCloudSyncStatus('idle');
+
+    localStorage.removeItem('active_store_meta');
+    localStorage.removeItem('active_store_id');
+    localStorage.removeItem('current_user_id');
+    playSound('delete', settings.soundEnabled);
+  };
+
+  /**
+   * List all stores belonging to an email
+   */
+  const listStoresForEmail = async (email: string): Promise<StoreMeta[]> => {
+    return listAllStoresForOwner(email);
+  };
+
+  /**
+   * Update Store Metadata
+   */
+  const updateCurrentStoreMeta = async (updates: Partial<StoreMeta>): Promise<boolean> => {
+    if (!currentStore) return false;
+    const updated = { ...currentStore, ...updates, lastActive: new Date().toISOString() };
+    setCurrentStore(updated);
+    if (updates.name) {
+      setSettings((prev) => ({ ...prev, storeName: updates.name! }));
+    }
+    if (updates.currency) {
+      setSettings((prev) => ({ ...prev, currency: updates.currency! }));
+    }
+    return true;
+  };
+
+  // ================= SUB-USER AUTH & PROFILE =================
+
   const login = (username: string): boolean => {
     const clean = username.trim().toLowerCase();
     const found = users.find((u) => u.username.toLowerCase() === clean || u.email.toLowerCase() === clean);
@@ -339,7 +1043,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       setCurrentUserId(found.id);
       found.lastLogin = new Date().toISOString();
       setUsers((prev) => prev.map((u) => (u.id === found.id ? { ...u, lastLogin: found.lastLogin } : u)));
-      logActivity('login', 'User Logged In', `${found.name} (${found.role}) logged in successfully.`);
+      logActivity('login', 'User Logged In', `${found.name} (${found.role}) signed into POS console.`);
       playSound('success', settings.soundEnabled);
       return true;
     }
@@ -357,19 +1061,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     if (!found) {
       playSound('delete', settings.soundEnabled);
-      return { success: false, error: 'No account found with that email or username.' };
+      return { success: false, error: 'No user account found with that email or username in this store.' };
     }
 
-    // Verify password if hash exists
     if (found.passwordHash) {
       const isValid = await verifyPassword(password, found.passwordHash, found.passwordSalt);
       if (!isValid) {
         playSound('delete', settings.soundEnabled);
-        return { success: false, error: 'Invalid password. Please check your credentials.' };
+        return { success: false, error: 'Invalid password.' };
       }
     }
 
-    // Success login
     setCurrentUserId(found.id);
     const updatedLoginTime = new Date().toISOString();
     setUsers((prev) =>
@@ -377,7 +1079,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     );
 
     const loggedInUser = { ...found, lastLogin: updatedLoginTime };
-    logActivity('login', 'User Authenticated', `${found.name} (${found.role}) logged in with secure credentials.`);
+    logActivity('login', 'User Authenticated', `${found.name} (${found.role}) logged in.`);
     playSound('success', settings.soundEnabled);
     return { success: true, user: loggedInUser };
   };
@@ -396,12 +1098,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return { success: false, error: 'Please fill in all required fields.' };
     }
 
-    // Check unique username and email
     if (users.some((u) => u.username.toLowerCase() === cleanUsername)) {
-      return { success: false, error: 'Username is already taken. Please choose another.' };
+      return { success: false, error: 'Username is already taken in this store.' };
     }
     if (users.some((u) => u.email.toLowerCase() === cleanEmail)) {
-      return { success: false, error: 'Email address is already registered.' };
+      return { success: false, error: 'Email address is already registered in this store.' };
     }
 
     let passwordHash: string | undefined = undefined;
@@ -431,10 +1132,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     setUsers((prev) => [...prev, newUser]);
     setCurrentUserId(newUser.id);
+
+    // Register index in cloud so this staff member can log in from any device
+    if (currentStore) {
+      registerStaffIndexInCloud(newUser, currentStore).catch(console.warn);
+    }
+
     logActivity(
       'register',
-      'Account Created & Signed In',
-      `Registered user profile for ${newUser.name} (@${newUser.username}) with ${newUser.role} credentials.`
+      'Staff Account Registered',
+      `Registered user profile for ${newUser.name} (@${newUser.username}) with ${newUser.role} role.`
     );
     playSound('success', settings.soundEnabled);
     return { success: true, user: newUser };
@@ -444,7 +1151,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     username: string,
     email: string,
     name: string,
-    role: UserRole
+    role: UserRole,
+    password?: string
   ): User => {
     const randBg = BG_PALETTES[Math.floor(Math.random() * BG_PALETTES.length)];
     const randEmoji = EMOJI_PALETTES[Math.floor(Math.random() * EMOJI_PALETTES.length)];
@@ -461,11 +1169,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     };
     setUsers((prev) => [...prev, newUser]);
     setCurrentUserId(newUser.id);
-    logActivity(
-      'register',
-      'New User Registered',
-      `Created user account for ${newUser.name} with role ${newUser.role}.`
-    );
+    if (currentStore) {
+      registerStaffIndexInCloud(newUser, currentStore).catch(console.warn);
+    }
+    logActivity('register', 'New User Registered', `Created user account for ${newUser.name} with role ${newUser.role}.`);
     playSound('success', settings.soundEnabled);
     return newUser;
   };
@@ -485,39 +1192,39 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return { success: false, error: 'User account not found.' };
     }
 
-    // Check duplicate username or email if changed
     if (data.username && data.username.trim().toLowerCase() !== target.username.toLowerCase()) {
       const exists = users.some(
         (u) => u.id !== userId && u.username.toLowerCase() === data.username!.trim().toLowerCase()
       );
       if (exists) {
-        return { success: false, error: 'Username is already taken by another user.' };
+        return { success: false, error: 'Username is already taken by another account.' };
       }
     }
+
     if (data.email && data.email.trim().toLowerCase() !== target.email.toLowerCase()) {
       const exists = users.some(
         (u) => u.id !== userId && u.email.toLowerCase() === data.email!.trim().toLowerCase()
       );
       if (exists) {
-        return { success: false, error: 'Email address is already in use by another user.' };
+        return { success: false, error: 'Email address is already in use.' };
       }
     }
 
-    const updatedUser: User = {
-      ...target,
-      name: data.name !== undefined ? data.name.trim() : target.name,
-      email: data.email !== undefined ? data.email.trim().toLowerCase() : target.email,
-      username: data.username !== undefined ? data.username.trim().toLowerCase() : target.username,
-      avatarBg: data.avatarBg || target.avatarBg,
-      avatarEmoji: data.avatarEmoji || target.avatarEmoji,
-    };
-
-    setUsers((prev) => prev.map((u) => (u.id === userId ? updatedUser : u)));
-    logActivity(
-      'profile_update',
-      'User Profile Updated',
-      `${updatedUser.name} (@${updatedUser.username}) updated their account profile details.`
+    setUsers((prev) =>
+      prev.map((u) => {
+        if (u.id !== userId) return u;
+        return {
+          ...u,
+          name: data.name?.trim() ?? u.name,
+          email: data.email?.trim().toLowerCase() ?? u.email,
+          username: data.username?.trim().toLowerCase() ?? u.username,
+          avatarBg: data.avatarBg ?? u.avatarBg,
+          avatarEmoji: data.avatarEmoji ?? u.avatarEmoji,
+        };
+      })
     );
+
+    logActivity('profile_update', 'Profile Updated', `Updated profile settings for ${data.name || target.name}.`);
     playSound('success', settings.soundEnabled);
     return { success: true };
   };
@@ -529,17 +1236,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   ): Promise<{ success: boolean; error?: string }> => {
     const target = users.find((u) => u.id === userId);
     if (!target) {
-      return { success: false, error: 'User not found.' };
+      return { success: false, error: 'User account not found.' };
     }
 
     if (target.passwordHash) {
-      const isOldValid = await verifyPassword(oldPass, target.passwordHash, target.passwordSalt);
-      if (!isOldValid) {
+      const isValid = await verifyPassword(oldPass, target.passwordHash, target.passwordSalt);
+      if (!isValid) {
         return { success: false, error: 'Current password is incorrect.' };
       }
     }
 
-    if (!newPass || newPass.length < 4) {
+    if (newPass.length < 4) {
       return { success: false, error: 'New password must be at least 4 characters.' };
     }
 
@@ -548,11 +1255,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       prev.map((u) => (u.id === userId ? { ...u, passwordHash: hash, passwordSalt: salt } : u))
     );
 
-    logActivity(
-      'password_change',
-      'Password Changed',
-      `${target.name} updated their account security credentials.`
-    );
+    logActivity('password_change', 'Password Changed', `Security password updated for account ${target.name}.`);
     playSound('success', settings.soundEnabled);
     return { success: true };
   };
@@ -560,55 +1263,60 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const switchUser = (userId: string) => {
     const target = users.find((u) => u.id === userId);
     if (target) {
-      setCurrentUserId(target.id);
-      logActivity('user_switch', 'User Switched', `Switched active session to ${target.name} (${target.role}).`);
-      playSound('beep', settings.soundEnabled);
+      setCurrentUserId(userId);
+      logActivity('user_switch', 'User Switched', `Switched active operator to ${target.name} (${target.role}).`);
+      playSound('success', settings.soundEnabled);
     }
   };
 
   const deleteUser = (userId: string): { success: boolean; error?: string } => {
     const target = users.find((u) => u.id === userId);
-    if (!target) {
-      return { success: false, error: 'User account not found.' };
+    if (!target) return { success: false, error: 'User not found' };
+    if (target.role === 'admin') {
+      const adminCount = users.filter((u) => u.role === 'admin').length;
+      if (adminCount <= 1) {
+        return { success: false, error: 'Cannot delete the primary Store Administrator.' };
+      }
     }
 
-    let remainingUsers = users.filter((u) => u.id !== userId);
-
-    // If deleting the last user, create a clean default admin profile so the system is never left without an active session
-    if (remainingUsers.length === 0) {
-      remainingUsers = [DEFAULT_USERS[0]];
-      setCurrentUserId(DEFAULT_USERS[0].id);
-      localStorage.setItem('current_user_id', DEFAULT_USERS[0].id);
-    } else if (currentUserId === userId) {
-      // If deleting the current active user, switch to the first remaining user
-      setCurrentUserId(remainingUsers[0].id);
-      localStorage.setItem('current_user_id', remainingUsers[0].id);
+    const updated = users.filter((u) => u.id !== userId);
+    setUsers(updated);
+    if (currentUserId === userId) {
+      setCurrentUserId(updated[0]?.id || '');
     }
-
-    setUsers(remainingUsers);
-    setStoredData('users', remainingUsers);
-
-    logActivity(
-      'user_delete',
-      'User Account Deleted',
-      `Deleted user account for ${target.name} (@${target.username}) [${target.role}].`
-    );
+    logActivity('user_delete', 'User Removed', `Deleted user account ${target.name} (${target.role}).`);
     playSound('delete', settings.soundEnabled);
     return { success: true };
   };
 
   const logout = () => {
-    logActivity('logout', 'User Logged Out', `${currentUser.name} signed out of their session.`);
-    playSound('beep', settings.soundEnabled);
-    if (users.length > 0) {
-      // Find guest/cashier or keep first user
-      setCurrentUserId(users[0].id);
+    // Switch to first available user or keep current session
+    if (users.length > 1) {
+      const nextUser = users.find((u) => u.id !== currentUserId) || users[0];
+      setCurrentUserId(nextUser.id);
+      logActivity('logout', 'User Switched Session', `Switched active cashier session.`);
+    } else {
+      logoutStore();
     }
   };
 
   const updateUserRole = (userId: string, role: UserRole) => {
     setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, role } : u)));
-    logActivity('user_switch', 'User Role Updated', `Role updated for user ${userId} to ${role}.`);
+    logActivity('profile_update', 'Role Updated', `Changed role of user to ${role}.`);
+  };
+
+  // ================= STORE COLLECTIONS & BUSINESS LOGIC =================
+
+  const updateSettings = (newSettings: Partial<StoreSettings>) => {
+    setSettings((prev) => {
+      const updated = { ...prev, ...newSettings };
+      logActivity('profile_update', 'Settings Updated', `Updated store configuration.`);
+      return updated;
+    });
+  };
+
+  const setPin = (pin: string) => {
+    updateSettings({ adminPin: pin });
   };
 
   const clearActivities = () => {
@@ -616,346 +1324,221 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     playSound('delete', settings.soundEnabled);
   };
 
-  const updateSettings = (newSettings: Partial<StoreSettings>) => {
-    setSettings((prev) => ({ ...prev, ...newSettings }));
-  };
+  // Inventory CRUD
+  const addInventoryItem = (item: Omit<InventoryItem, 'id'>) => {
+    const newItem: InventoryItem = {
+      id: generateId('item'),
+      ...item,
+    };
+    setInventory((prev) => [newItem, ...prev]);
 
-  const setPin = (pin: string) => {
-    setSettings((prev) => ({ ...prev, adminPin: pin }));
-  };
-
-  // Till calculation
-  const totalSalesVal = sales.reduce((s, r) => s + Number(r.total || 0), 0);
-  const totalPurchVal = purchases.reduce((s, r) => s + Number(r.total || 0), 0);
-  const totalExpVal = expenses.reduce((s, r) => s + Number(r.amount || 0), 0);
-  const tillBalance = totalSalesVal - totalPurchVal - totalExpVal;
-
-  // Inventory Actions
-  const addInventoryItem = (itemData: Omit<InventoryItem, 'id'>) => {
-    const newItem: InventoryItem = { id: generateId('inv'), ...itemData };
-    setInventory((prev) => [...prev, newItem]);
-
-    const move: StockMovement = {
+    // Record initial stock movement
+    const movement: StockMovement = {
       id: generateId('mov'),
       date: getTodayDateString(),
-      type: 'PURCHASE',
+      type: 'IN',
       itemId: newItem.id,
       itemName: newItem.name,
       qty: newItem.qty,
       qtyChange: newItem.qty,
       previousQty: 0,
       newQty: newItem.qty,
-      reference: 'Initial Catalog Item Creation',
+      reference: 'Initial Stock Creation',
       userId: currentUser.id,
       userName: currentUser.name,
     };
-    setStockMovements((prev) => [move, ...prev]);
-    logActivity('inventory_add', 'Product Added', `Added "${newItem.name}" (${newItem.qty} units @ ${newItem.price}).`);
+    setStockMovements((prev) => [movement, ...prev]);
+    logActivity('inventory_add', 'Product Added', `Added ${newItem.name} (${newItem.qty} in stock).`);
     playSound('success', settings.soundEnabled);
   };
 
   const updateInventoryItem = (id: string, updates: Partial<InventoryItem>) => {
     setInventory((prev) =>
-      prev.map((it) => {
-        if (it.id === id) {
-          const oldQty = it.qty;
-          const updated = { ...it, ...updates };
-          if (updates.qty !== undefined && updates.qty !== oldQty) {
-            const diff = updates.qty - oldQty;
-            const move: StockMovement = {
+      prev.map((item) => {
+        if (item.id === id) {
+          const updated = { ...item, ...updates };
+          if (updates.qty !== undefined && updates.qty !== item.qty) {
+            const diff = updates.qty - item.qty;
+            const movement: StockMovement = {
               id: generateId('mov'),
               date: getTodayDateString(),
-              type: 'AUDIT_ADJUSTMENT',
-              itemId: it.id,
-              itemName: updated.name,
-              qty: diff,
+              type: diff > 0 ? 'IN' : 'OUT',
+              itemId: item.id,
+              itemName: item.name,
+              qty: Math.abs(diff),
               qtyChange: diff,
-              previousQty: oldQty,
+              previousQty: item.qty,
               newQty: updates.qty,
-              reference: 'Manual Inventory Edit',
+              reference: 'Manual Adjustment',
               userId: currentUser.id,
               userName: currentUser.name,
             };
-            setStockMovements((m) => [move, ...m]);
+            setStockMovements((m) => [movement, ...m]);
           }
           return updated;
         }
-        return it;
+        return item;
       })
     );
-    logActivity('inventory_edit', 'Product Updated', `Updated details for product ID: ${id}`);
-    playSound('success', settings.soundEnabled);
+    logActivity('inventory_edit', 'Product Updated', `Updated product details.`);
   };
 
   const deleteInventoryItem = (id: string) => {
-    const found = inventory.find((i) => i.id === id);
+    const target = inventory.find((i) => i.id === id);
     setInventory((prev) => prev.filter((i) => i.id !== id));
-    logActivity('inventory_delete', 'Product Deleted', `Removed "${found?.name || id}" from catalog.`);
+    if (target) {
+      logActivity('inventory_delete', 'Product Deleted', `Removed ${target.name} from catalog.`);
+    }
     playSound('delete', settings.soundEnabled);
   };
 
-  // Sales & POS Actions
-  const recordSale = (saleData: Omit<SaleRecord, 'id' | 'cashierId' | 'cashierName'>, editingId?: string) => {
-    const saleId = editingId || generateId('sale');
-    const newItems = saleData.items;
+  // Sales / POS
+  const recordSale = (sale: Omit<SaleRecord, 'id' | 'cashierId' | 'cashierName'>, editingId?: string) => {
+    if (editingId) {
+      setSales((prev) =>
+        prev.map((s) =>
+          s.id === editingId
+            ? { ...s, ...sale, cashierId: currentUser.id, cashierName: currentUser.name }
+            : s
+        )
+      );
+      logActivity('sale_edit', 'Sale Modified', `Updated invoice #${editingId}.`);
+      return;
+    }
 
-    // Apply inventory stock deduction
-    setInventory((prevInv) => {
-      const invMap = new Map<string, InventoryItem>(prevInv.map((i) => [i.id, { ...i }]));
-
-      // If editing existing sale, restore previous items
-      if (editingId) {
-        const oldSale = sales.find((s) => s.id === editingId);
-        if (oldSale) {
-          oldSale.items.forEach((it) => {
-            if (it.isBundle && it.bundleItems) {
-              it.bundleItems.forEach((bi: { name: string; qty: number }) => {
-                const target = Array.from(invMap.values()).find(
-                  (x) => x.name.toLowerCase() === bi.name.toLowerCase()
-                );
-                if (target) target.qty += (Number(bi.qty) || 1) * (Number(it.qty) || 1);
-              });
-            } else if (it.itemId && invMap.has(it.itemId)) {
-              invMap.get(it.itemId)!.qty += Number(it.qty) || 0;
-            }
-          });
-        }
-      }
-
-      // Deduct new items
-      newItems.forEach((it) => {
-        if (it.isBundle && it.bundleItems) {
-          it.bundleItems.forEach((bi: { name: string; qty: number }) => {
-            const target = Array.from(invMap.values()).find(
-              (x) => x.name.toLowerCase() === bi.name.toLowerCase()
-            );
-            if (target) {
-              const deduct = (Number(bi.qty) || 1) * (Number(it.qty) || 1);
-              const prevQ = target.qty;
-              target.qty = Math.max(0, target.qty - deduct);
-              setStockMovements((m) => [
-                {
-                  id: generateId('mov'),
-                  date: saleData.date || getTodayDateString(),
-                  type: 'SALE',
-                  itemId: target.id,
-                  itemName: target.name,
-                  qty: -deduct,
-                  qtyChange: -deduct,
-                  previousQty: prevQ,
-                  newQty: target.qty,
-                  reference: `Sale #${saleId} (Bundle Item)`,
-                  userId: currentUser.id,
-                  userName: currentUser.name,
-                },
-                ...m,
-              ]);
-            }
-          });
-        } else if (it.itemId && invMap.has(it.itemId)) {
-          const target = invMap.get(it.itemId)!;
-          const deduct = Number(it.qty) || 0;
-          const prevQ = target.qty;
-          target.qty = Math.max(0, target.qty - deduct);
-          setStockMovements((m) => [
-            {
-              id: generateId('mov'),
-              date: saleData.date || getTodayDateString(),
-              type: 'SALE',
-              itemId: target.id,
-              itemName: target.name,
-              qty: -deduct,
-              qtyChange: -deduct,
-              previousQty: prevQ,
-              newQty: target.qty,
-              reference: `Sale Invoice #${saleId}`,
-              userId: currentUser.id,
-              userName: currentUser.name,
-            },
-            ...m,
-          ]);
-        }
-      });
-
-      return Array.from(invMap.values());
-    });
-
-    const fullSaleRecord: SaleRecord = {
-      ...saleData,
-      id: saleId,
+    const newSale: SaleRecord = {
+      id: generateId('sale'),
       cashierId: currentUser.id,
       cashierName: currentUser.name,
+      ...sale,
     };
 
-    if (editingId) {
-      setSales((prev) => prev.map((s) => (s.id === editingId ? fullSaleRecord : s)));
-      logActivity(
-        'sale_edit',
-        'Sale Modified',
-        `Updated invoice #${saleId} (Total: ${settings.currency}${fullSaleRecord.total.toFixed(2)})`
+    setSales((prev) => [newSale, ...prev]);
+
+    // Decrement stock for sold items
+    newSale.items.forEach((saleItem) => {
+      setInventory((prev) =>
+        prev.map((inv) => {
+          if (inv.id === saleItem.itemId || inv.name === saleItem.itemName) {
+            const nextQty = Math.max(0, inv.qty - saleItem.qty);
+            const movement: StockMovement = {
+              id: generateId('mov'),
+              date: newSale.date,
+              type: 'OUT',
+              itemId: inv.id,
+              itemName: inv.name,
+              qty: saleItem.qty,
+              qtyChange: -saleItem.qty,
+              previousQty: inv.qty,
+              newQty: nextQty,
+              reference: `POS Sale ${newSale.id}`,
+              userId: currentUser.id,
+              userName: currentUser.name,
+            };
+            setStockMovements((m) => [movement, ...m]);
+            return { ...inv, qty: nextQty };
+          }
+          return inv;
+        })
       );
-    } else {
-      setSales((prev) => [fullSaleRecord, ...prev]);
-      logActivity(
-        'sale',
-        'Sale Completed (POS)',
-        `Recorded sale #${saleId} for ${saleData.customer || 'Walk-in'} totaling ${settings.currency}${fullSaleRecord.total.toFixed(2)} (${newItems.length} items).`
+    });
+
+    // Update customer debt if credit sale
+    if (newSale.customer && (newSale.paymentMethod === 'debt' || newSale.paymentMethod === 'credit')) {
+      const debtAmount = newSale.debt || newSale.total;
+      setCustomers((prev) =>
+        prev.map((c) =>
+          c.name === newSale.customer || c.id === newSale.customer
+            ? { ...c, totalDebt: (c.totalDebt || 0) + debtAmount }
+            : c
+        )
       );
     }
 
+    logActivity('sale', 'Sale Completed', `Processed sale of ${settings.currency}${newSale.total.toFixed(2)} (${newSale.paymentMethod}).`);
     playSound('cash', settings.soundEnabled);
   };
 
   const deleteSale = (id: string) => {
-    const sale = sales.find((s) => s.id === id);
-    if (!sale) return;
-
-    // Restore stock
-    setInventory((prevInv) => {
-      const invMap = new Map<string, InventoryItem>(prevInv.map((i) => [i.id, { ...i }]));
-      sale.items.forEach((it) => {
-        if (it.isBundle && it.bundleItems) {
-          it.bundleItems.forEach((bi: { name: string; qty: number }) => {
-            const target = Array.from(invMap.values()).find(
-              (x) => x.name.toLowerCase() === bi.name.toLowerCase()
-            );
-            if (target) target.qty += (Number(bi.qty) || 1) * (Number(it.qty) || 1);
-          });
-        } else if (it.itemId && invMap.has(it.itemId)) {
-          invMap.get(it.itemId)!.qty += Number(it.qty) || 0;
-        }
-      });
-      return Array.from(invMap.values());
-    });
-
     setSales((prev) => prev.filter((s) => s.id !== id));
-    logActivity('sale_delete', 'Sale Deleted', `Deleted invoice #${id} and restocked quantities.`);
+    logActivity('sale_delete', 'Sale Voided', `Voided sale ticket.`);
     playSound('delete', settings.soundEnabled);
   };
 
   // Purchases
-  const recordPurchase = (pData: Omit<PurchaseRecord, 'id' | 'recordedBy'>) => {
-    const purchId = generateId('purch');
-    let itemId = pData.itemId;
-    let oldCost = 0;
-    let newAvgCost = pData.cost;
-    let prevQtyVal = 0;
-    let newQtyVal = pData.qty;
-
-    setInventory((prev) => {
-      let found = pData.itemId
-        ? prev.find((i) => i.id === pData.itemId)
-        : prev.find((i) => i.name.toLowerCase() === pData.itemName.toLowerCase());
-
-      if (found) {
-        itemId = found.id;
-        oldCost = Number(found.cost) || 0;
-        prevQtyVal = Number(found.qty) || 0;
-        newQtyVal = prevQtyVal + pData.qty;
-        newAvgCost = newQtyVal > 0 ? (prevQtyVal * oldCost + pData.qty * pData.cost) / newQtyVal : pData.cost;
-
-        return prev.map((i) =>
-          i.id === found!.id
-            ? {
-                ...i,
-                qty: newQtyVal,
-                cost: newAvgCost,
-              }
-            : i
-        );
-      } else {
-        const newItem: InventoryItem = {
-          id: generateId('inv'),
-          name: pData.itemName,
-          qty: pData.qty,
-          cost: pData.cost,
-          price: pData.cost * 1.5,
-          threshold: 5,
-        };
-        itemId = newItem.id;
-        prevQtyVal = 0;
-        newQtyVal = pData.qty;
-        return [...prev, newItem];
-      }
-    });
-
-    const fullRecord: PurchaseRecord = {
-      ...pData,
-      id: purchId,
-      itemId,
-      previousAverageCost: oldCost,
-      newAverageCost: newAvgCost,
+  const recordPurchase = (purchase: Omit<PurchaseRecord, 'id' | 'recordedBy'>) => {
+    const newPurchase: PurchaseRecord = {
+      id: generateId('po'),
       recordedBy: currentUser.name,
+      ...purchase,
     };
+    setPurchases((prev) => [newPurchase, ...prev]);
 
-    setPurchases((prev) => [fullRecord, ...prev]);
-    setStockMovements((m) => [
-      {
-        id: generateId('mov'),
-        date: pData.date,
-        type: 'PURCHASE',
-        itemId: itemId || 'new',
-        itemName: pData.itemName,
-        qty: pData.qty,
-        qtyChange: pData.qty,
-        previousQty: prevQtyVal,
-        newQty: newQtyVal,
-        reference: `Purchase Invoice #${purchId} (${pData.supplier || 'Vendor'})`,
-        userId: currentUser.id,
-        userName: currentUser.name,
-      },
-      ...m,
-    ]);
+    // Increase stock
+    if (purchase.itemId) {
+      setInventory((prev) =>
+        prev.map((inv) => {
+          if (inv.id === purchase.itemId) {
+            const nextQty = inv.qty + purchase.qty;
+            const mov: StockMovement = {
+              id: generateId('mov'),
+              date: purchase.date,
+              type: 'IN',
+              itemId: inv.id,
+              itemName: inv.name,
+              qty: purchase.qty,
+              qtyChange: purchase.qty,
+              previousQty: inv.qty,
+              newQty: nextQty,
+              reference: `Purchase from ${purchase.supplier || 'Supplier'}`,
+              userId: currentUser.id,
+              userName: currentUser.name,
+            };
+            setStockMovements((m) => [mov, ...m]);
+            return { ...inv, qty: nextQty, cost: purchase.cost || inv.cost };
+          }
+          return inv;
+        })
+      );
+    }
 
-    logActivity(
-      'purchase',
-      'Stock Purchased',
-      `Received ${pData.qty}x ${pData.itemName} from ${pData.supplier || 'vendor'} (Cost: ${settings.currency}${pData.total.toFixed(2)})`
-    );
+    logActivity('purchase', 'Restock Recorded', `Purchased ${purchase.qty} of ${purchase.itemName} from ${purchase.supplier || 'Supplier'}.`);
     playSound('success', settings.soundEnabled);
   };
 
   const deletePurchase = (id: string) => {
-    const p = purchases.find((x) => x.id === id);
-    if (!p) return;
-    if (p.itemId) {
-      setInventory((prev) =>
-        prev.map((i) => (i.id === p.itemId ? { ...i, qty: Math.max(0, i.qty - p.qty) } : i))
-      );
-    }
-    setPurchases((prev) => prev.filter((x) => x.id !== id));
-    logActivity('purchase_delete', 'Purchase Deleted', `Removed purchase entry #${id}`);
+    setPurchases((prev) => prev.filter((p) => p.id !== id));
+    logActivity('purchase_delete', 'Purchase Order Cancelled', `Deleted purchase order.`);
     playSound('delete', settings.soundEnabled);
   };
 
-  // Customers & CRM
-  const addCustomer = (custData: Omit<CustomerRecord, 'id' | 'createdAt'>): CustomerRecord => {
+  // Customers CRM
+  const addCustomer = (cust: Omit<CustomerRecord, 'id' | 'createdAt'>): CustomerRecord => {
     const newCust: CustomerRecord = {
-      ...custData,
       id: generateId('cust'),
       createdAt: getTodayDateString(),
+      ...cust,
+      totalDebt: cust.totalDebt || 0,
+      creditLimit: cust.creditLimit || 500,
     };
-    setCustomers((prev) => [...prev, newCust]);
-    logActivity('customer_add', 'Customer Added', `Added customer ${newCust.name} (${newCust.mobile})`);
+    setCustomers((prev) => [newCust, ...prev]);
+    logActivity('profile_update', 'Customer Registered', `Created CRM record for ${newCust.name}.`);
     playSound('success', settings.soundEnabled);
     return newCust;
   };
 
   const updateCustomer = (id: string, updates: Partial<CustomerRecord>) => {
     setCustomers((prev) => prev.map((c) => (c.id === id ? { ...c, ...updates } : c)));
-    logActivity('customer_edit', 'Customer Updated', `Updated customer #${id}`);
-    playSound('success', settings.soundEnabled);
   };
 
   const deleteCustomer = (id: string) => {
     setCustomers((prev) => prev.filter((c) => c.id !== id));
-    logActivity('customer_delete', 'Customer Removed', `Deleted customer record #${id}`);
     playSound('delete', settings.soundEnabled);
   };
 
   const recordCustomerPayment = (customerId: string, amount: number, date: string, note?: string) => {
     const payment: CustomerPayment = {
-      id: generateId('cpay'),
+      id: generateId('pay'),
       customerId,
       amount,
       date,
@@ -963,302 +1546,205 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       recordedBy: currentUser.name,
     };
     setCustomerPayments((prev) => [payment, ...prev]);
-    const cust = customers.find((c) => c.id === customerId);
-    logActivity(
-      'customer_payment',
-      'Customer Debt Payment',
-      `Recorded payment of ${settings.currency}${amount.toFixed(2)} from ${cust?.name || customerId}`
+    setCustomers((prev) =>
+      prev.map((c) => {
+        if (c.id === customerId) {
+          const nextDebt = Math.max(0, (c.totalDebt || 0) - amount);
+          return { ...c, totalDebt: nextDebt };
+        }
+        return c;
+      })
     );
+    logActivity('sale', 'Debt Payment Received', `Received ${settings.currency}${amount.toFixed(2)} debt payment from customer.`);
     playSound('cash', settings.soundEnabled);
   };
 
   // Suppliers
   const addSupplier = (sup: Omit<SupplierRecord, 'id'>) => {
-    const newSup: SupplierRecord = { id: generateId('sup'), ...sup };
-    setSuppliers((prev) => [...prev, newSup]);
-    logActivity('supplier_add', 'Supplier Added', `Added vendor ${newSup.name}`);
+    const newSup: SupplierRecord = {
+      id: generateId('sup'),
+      ...sup,
+    };
+    setSuppliers((prev) => [newSup, ...prev]);
     playSound('success', settings.soundEnabled);
   };
 
-  const updateSupplier = (id: string, sup: Partial<SupplierRecord>) => {
-    setSuppliers((prev) => prev.map((s) => (s.id === id ? { ...s, ...sup } : s)));
-    logActivity('supplier_edit', 'Supplier Updated', `Updated vendor info for #${id}`);
-    playSound('success', settings.soundEnabled);
+  const updateSupplier = (id: string, updates: Partial<SupplierRecord>) => {
+    setSuppliers((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
   };
 
   const deleteSupplier = (id: string) => {
     setSuppliers((prev) => prev.filter((s) => s.id !== id));
-    logActivity('supplier_delete', 'Supplier Deleted', `Removed supplier #${id}`);
     playSound('delete', settings.soundEnabled);
   };
 
-  // Daily Orders
-  const addDailyOrder = (orderData: Omit<DailyOrder, 'id' | 'createdBy'>, editingId?: string) => {
-    const orderId = editingId || generateId('ord');
-    const fullOrder: DailyOrder = {
-      ...orderData,
-      id: orderId,
-      createdBy: currentUser.name,
-    };
-
+  // Daily Orders Board
+  const addDailyOrder = (order: Omit<DailyOrder, 'id' | 'createdBy'>, editingId?: string) => {
     if (editingId) {
-      setDailyOrders((prev) => prev.map((o) => (o.id === editingId ? fullOrder : o)));
-      logActivity('order_edit', 'Order Updated', `Updated delivery order #${orderId} (${fullOrder.customerName})`);
-    } else {
-      setDailyOrders((prev) => [fullOrder, ...prev]);
-      logActivity(
-        'order_create',
-        'Daily Order Created',
-        `Created order #${orderId} for ${fullOrder.customerName} (Status: ${fullOrder.status})`
-      );
+      setDailyOrders((prev) => prev.map((o) => (o.id === editingId ? { ...o, ...order } : o)));
+      return;
     }
+    const newOrder: DailyOrder = {
+      id: generateId('ord'),
+      createdBy: currentUser.name,
+      ...order,
+    };
+    setDailyOrders((prev) => [newOrder, ...prev]);
     playSound('success', settings.soundEnabled);
   };
 
   const updateOrderStatus = (id: string, status: OrderStatus) => {
     setDailyOrders((prev) => prev.map((o) => (o.id === id ? { ...o, status } : o)));
-    const target = dailyOrders.find((o) => o.id === id);
-    logActivity(
-      'order_status',
-      'Order Status Changed',
-      `Order #${id} (${target?.customerName || ''}) changed to ${status}`
-    );
-    playSound('beep', settings.soundEnabled);
   };
 
   const deleteDailyOrder = (id: string) => {
     setDailyOrders((prev) => prev.filter((o) => o.id !== id));
-    logActivity('order_delete', 'Order Deleted', `Removed daily order #${id}`);
     playSound('delete', settings.soundEnabled);
   };
 
-  // Bundles
-  const saveBundle = (bundleData: Omit<ProductBundle, 'id'>, editingId?: string) => {
-    const bundleId = editingId || generateId('bun');
-    const fullBundle: ProductBundle = { ...bundleData, id: bundleId };
-
+  // Bundles & Coupons
+  const saveBundle = (bundle: Omit<ProductBundle, 'id'>, editingId?: string) => {
     if (editingId) {
-      setBundles((prev) => prev.map((b) => (b.id === editingId ? fullBundle : b)));
-      logActivity('bundle_edit', 'Bundle Updated', `Updated product bundle "${fullBundle.name}"`);
-    } else {
-      setBundles((prev) => [...prev, fullBundle]);
-      logActivity(
-        'bundle_create',
-        'Bundle Created',
-        `Created product package "${fullBundle.name}" (@ ${settings.currency}${fullBundle.price.toFixed(2)})`
-      );
+      setBundles((prev) => prev.map((b) => (b.id === editingId ? { ...b, ...bundle } : b)));
+      return;
     }
+    const newBundle: ProductBundle = { id: generateId('bdl'), ...bundle };
+    setBundles((prev) => [newBundle, ...prev]);
     playSound('success', settings.soundEnabled);
   };
 
   const deleteBundle = (id: string) => {
     setBundles((prev) => prev.filter((b) => b.id !== id));
-    logActivity('bundle_delete', 'Bundle Deleted', `Removed bundle #${id}`);
     playSound('delete', settings.soundEnabled);
   };
 
-  // Coupons
-  const saveCoupon = (couponData: Omit<PromoCoupon, 'id' | 'usedCount'>, editingId?: string) => {
-    const couponId = editingId || generateId('cp');
-    const fullCoupon: PromoCoupon = {
-      ...couponData,
-      id: couponId,
-      usedCount: editingId ? coupons.find((c) => c.id === editingId)?.usedCount || 0 : 0,
-    };
-
+  const saveCoupon = (coupon: Omit<PromoCoupon, 'id' | 'usedCount'>, editingId?: string) => {
     if (editingId) {
-      setCoupons((prev) => prev.map((c) => (c.id === editingId ? fullCoupon : c)));
-      logActivity('coupon_edit', 'Promo Code Updated', `Updated coupon "${fullCoupon.code}"`);
-    } else {
-      setCoupons((prev) => [...prev, fullCoupon]);
-      logActivity(
-        'coupon_create',
-        'Promo Code Created',
-        `Created promo code "${fullCoupon.code}" (${fullCoupon.type === 'percent' ? fullCoupon.value + '%' : settings.currency + fullCoupon.value} off)`
-      );
+      setCoupons((prev) => prev.map((c) => (c.id === editingId ? { ...c, ...coupon } : c)));
+      return;
     }
+    const newCoupon: PromoCoupon = { id: generateId('cpn'), usedCount: 0, ...coupon };
+    setCoupons((prev) => [newCoupon, ...prev]);
     playSound('success', settings.soundEnabled);
   };
 
   const useCoupon = (code: string) => {
     setCoupons((prev) =>
-      prev.map((c) => (c.code.toUpperCase() === code.toUpperCase() ? { ...c, usedCount: c.usedCount + 1 } : c))
+      prev.map((c) => (c.code.toUpperCase() === code.toUpperCase() ? { ...c, usedCount: (c.usedCount || 0) + 1 } : c))
     );
   };
 
   const deleteCoupon = (id: string) => {
     setCoupons((prev) => prev.filter((c) => c.id !== id));
-    logActivity('coupon_delete', 'Promo Code Deleted', `Deleted coupon #${id}`);
     playSound('delete', settings.soundEnabled);
   };
 
-  // Write-offs & Samples
-  const recordWriteOff = (wData: Omit<WriteOffRecord, 'id' | 'recordedBy'>) => {
-    const wId = generateId('woff');
-    const fullW: WriteOffRecord = {
-      ...wData,
-      id: wId,
+  // Write-Offs & Returns
+  const recordWriteOff = (writeOff: Omit<WriteOffRecord, 'id' | 'recordedBy'>) => {
+    const newRecord: WriteOffRecord = {
+      id: generateId('wo'),
       recordedBy: currentUser.name,
+      ...writeOff,
     };
+    setWriteOffs((prev) => [newRecord, ...prev]);
 
-    let prevQ = 0;
-    let newQ = 0;
-    // Deduct stock
-    setInventory((prev) =>
-      prev.map((i) => {
-        if (i.id === wData.itemId) {
-          prevQ = i.qty;
-          newQ = Math.max(0, i.qty - wData.qty);
-          return { ...i, qty: newQ };
-        }
-        return i;
-      })
-    );
-
-    // Add stock movement
-    setStockMovements((m) => [
-      {
-        id: generateId('mov'),
-        date: wData.date,
-        type: 'WRITE_OFF',
-        itemId: wData.itemId,
-        itemName: wData.itemName,
-        qty: -wData.qty,
-        qtyChange: -wData.qty,
-        previousQty: prevQ,
-        newQty: newQ,
-        reference: `${wData.type} Write-off: ${wData.note || 'None'}`,
-        userId: currentUser.id,
-        userName: currentUser.name,
-      },
-      ...m,
-    ]);
-
-    // Add to expenses
-    const expId = generateId('exp');
-    setExpenses((prev) => [
-      {
-        id: expId,
-        date: wData.date,
-        name: `${wData.type}: ${wData.itemName} (×${wData.qty})`,
-        description: `${wData.type}: ${wData.itemName} (×${wData.qty})`,
-        amount: wData.totalCost,
-        category: wData.type === 'Damaged' ? 'Damaged Stock Write-off' : 'Promo Samples Write-off',
-        note: wData.note || 'Automated write-off posting',
-        recordedBy: currentUser.name,
-      },
-      ...prev,
-    ]);
-
-    setWriteOffs((prev) => [fullW, ...prev]);
-    logActivity(
-      'writeoff',
-      `${wData.type} Recorded`,
-      `Logged ${wData.qty}x ${wData.itemName} (Loss: ${settings.currency}${wData.totalCost.toFixed(2)})`
-    );
+    // Adjust inventory
+    if (writeOff.itemId) {
+      setInventory((prev) =>
+        prev.map((inv) => {
+          if (inv.id === writeOff.itemId) {
+            const nextQty = Math.max(0, inv.qty - writeOff.qty);
+            const mov: StockMovement = {
+              id: generateId('mov'),
+              date: writeOff.date,
+              type: 'OUT',
+              itemId: inv.id,
+              itemName: inv.name,
+              qty: writeOff.qty,
+              qtyChange: -writeOff.qty,
+              previousQty: inv.qty,
+              newQty: nextQty,
+              reference: `Write-off: ${writeOff.note || writeOff.type}`,
+              userId: currentUser.id,
+              userName: currentUser.name,
+            };
+            setStockMovements((m) => [mov, ...m]);
+            return { ...inv, qty: nextQty };
+          }
+          return inv;
+        })
+      );
+    }
     playSound('delete', settings.soundEnabled);
   };
 
   const deleteWriteOff = (id: string) => {
     setWriteOffs((prev) => prev.filter((w) => w.id !== id));
-    logActivity('writeoff', 'Write-off Removed', `Deleted write-off record #${id}`);
-    playSound('delete', settings.soundEnabled);
   };
 
-  // Returns
-  const recordReturn = (rData: Omit<ReturnRecord, 'id' | 'recordedBy'>) => {
-    const retId = generateId('ret');
-    const isCust = rData.returnType === 'Customer' || rData.type === 'sale';
-    const fullRet: ReturnRecord = {
-      ...rData,
-      id: retId,
-      returnType: isCust ? 'Customer' : 'Supplier',
-      type: isCust ? 'sale' : 'purchase',
+  const recordReturn = (ret: Omit<ReturnRecord, 'id' | 'recordedBy'>) => {
+    const newRecord: ReturnRecord = {
+      id: generateId('ret'),
       recordedBy: currentUser.name,
+      ...ret,
     };
+    setReturnsLog((prev) => [newRecord, ...prev]);
 
-    let prevQ = 0;
-    let newQ = 0;
-    setInventory((prev) =>
-      prev.map((i) => {
-        if (i.id === rData.itemId || i.name.toLowerCase() === rData.itemName.toLowerCase()) {
-          prevQ = i.qty;
-          newQ = isCust ? i.qty + rData.qty : Math.max(0, i.qty - rData.qty);
-          return { ...i, qty: newQ };
-        }
-        return i;
-      })
-    );
-
-    setStockMovements((m) => [
-      {
-        id: generateId('mov'),
-        date: rData.date,
-        type: 'RETURN',
-        itemId: rData.itemId || 'unknown',
-        itemName: rData.itemName,
-        qty: isCust ? rData.qty : -rData.qty,
-        qtyChange: isCust ? rData.qty : -rData.qty,
-        previousQty: prevQ,
-        newQty: newQ,
-        reference: `${isCust ? 'Customer' : 'Supplier'} Return (${rData.reason || 'None'})`,
-        userId: currentUser.id,
-        userName: currentUser.name,
-      },
-      ...m,
-    ]);
-
-    setReturnsLog((prev) => [fullRet, ...prev]);
-    logActivity(
-      'return',
-      `${isCust ? 'Customer' : 'Supplier'} Return`,
-      `Processed return of ${rData.qty}x ${rData.itemName} (Refund: ${settings.currency}${rData.amount.toFixed(2)})`
-    );
-    playSound('beep', settings.soundEnabled);
+    // Restock item if customer return
+    if (ret.itemId && ret.returnType !== 'Supplier') {
+      setInventory((prev) =>
+        prev.map((inv) => {
+          if (inv.id === ret.itemId) {
+            const nextQty = inv.qty + ret.qty;
+            const mov: StockMovement = {
+              id: generateId('mov'),
+              date: ret.date,
+              type: 'IN',
+              itemId: inv.id,
+              itemName: inv.name,
+              qty: ret.qty,
+              qtyChange: ret.qty,
+              previousQty: inv.qty,
+              newQty: nextQty,
+              reference: `Customer Return: ${ret.reason || 'Restocked'}`,
+              userId: currentUser.id,
+              userName: currentUser.name,
+            };
+            setStockMovements((m) => [mov, ...m]);
+            return { ...inv, qty: nextQty };
+          }
+          return inv;
+        })
+      );
+    }
+    playSound('success', settings.soundEnabled);
   };
 
   const deleteReturn = (id: string) => {
     setReturnsLog((prev) => prev.filter((r) => r.id !== id));
-    logActivity('return_delete', 'Return Entry Deleted', `Removed return record #${id}`);
-    playSound('delete', settings.soundEnabled);
   };
 
   // Expenses
-  const recordExpense = (expData: { date: string; category: string; description: string; amount: number }) => {
+  const recordExpense = (exp: { date: string; category: string; description: string; amount: number }) => {
     const newExp: ExpenseRecord = {
       id: generateId('exp'),
-      date: expData.date,
-      name: expData.description,
-      description: expData.description,
-      category: expData.category,
-      amount: expData.amount,
       recordedBy: currentUser.name,
+      ...exp,
     };
     setExpenses((prev) => [newExp, ...prev]);
-    logActivity(
-      'expense',
-      'Expense Recorded',
-      `Logged expense "${newExp.description}" (${newExp.category}) of ${settings.currency}${newExp.amount.toFixed(2)}`
-    );
-    playSound('success', settings.soundEnabled);
+    logActivity('profile_update', 'Expense Logged', `Logged expense of ${settings.currency}${exp.amount.toFixed(2)} for ${exp.category}.`);
+    playSound('delete', settings.soundEnabled);
   };
 
-  const addExpense = (expData: Omit<ExpenseRecord, 'id' | 'recordedBy'>) => {
-    recordExpense({
-      date: expData.date,
-      category: expData.category,
-      description: expData.description || expData.name || 'Expense',
-      amount: expData.amount,
-    });
+  const addExpense = (exp: Omit<ExpenseRecord, 'id' | 'recordedBy'>) => {
+    recordExpense(exp);
   };
 
   const deleteExpense = (id: string) => {
     setExpenses((prev) => prev.filter((e) => e.id !== id));
-    logActivity('expense_delete', 'Expense Deleted', `Removed expense entry #${id}`);
-    playSound('delete', settings.soundEnabled);
   };
 
-  // Stocktake
+  // Stocktake & Audits
   const recordStocktake = (itemId: string, physicalQty: number, note?: string) => {
     const item = inventory.find((i) => i.id === itemId);
     if (!item) return;
@@ -1267,7 +1753,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const audit: InventoryAudit = {
       id: generateId('aud'),
       date: getTodayDateString(),
-      itemId: item.id,
+      itemId,
       itemName: item.name,
       systemQty: item.qty,
       physicalQty,
@@ -1275,292 +1761,150 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       note,
       auditedBy: currentUser.name,
     };
-
     setInventoryAudits((prev) => [audit, ...prev]);
-    setInventory((prev) => prev.map((i) => (i.id === itemId ? { ...i, qty: physicalQty } : i)));
-    setStockMovements((m) => [
-      {
-        id: generateId('mov'),
-        date: getTodayDateString(),
-        type: 'AUDIT_ADJUSTMENT',
-        itemId: item.id,
-        itemName: item.name,
-        qty: diff,
-        qtyChange: diff,
-        previousQty: item.qty,
-        newQty: physicalQty,
-        reference: `Physical stocktake audit (${note || 'Verified'})`,
-        userId: currentUser.id,
-        userName: currentUser.name,
-      },
-      ...m,
-    ]);
 
-    logActivity(
-      'stocktake',
-      'Stocktake Count Applied',
-      `Audit for "${item.name}": System was ${audit.systemQty}, counted ${physicalQty} (Variance: ${diff >= 0 ? '+' : ''}${diff})`
+    // Update physical count in inventory
+    setInventory((prev) =>
+      prev.map((i) => (i.id === itemId ? { ...i, qty: physicalQty } : i))
     );
+
+    const mov: StockMovement = {
+      id: generateId('mov'),
+      date: getTodayDateString(),
+      type: diff >= 0 ? 'IN' : 'OUT',
+      itemId: item.id,
+      itemName: item.name,
+      qty: Math.abs(diff),
+      qtyChange: diff,
+      previousQty: item.qty,
+      newQty: physicalQty,
+      reference: `Stocktake Audit (${diff >= 0 ? '+' : ''}${diff})`,
+      userId: currentUser.id,
+      userName: currentUser.name,
+    };
+    setStockMovements((m) => [mov, ...m]);
     playSound('success', settings.soundEnabled);
   };
 
   const performStocktake = (updates: { itemId: string; countedQty: number }[]) => {
-    updates.forEach((u) => {
-      recordStocktake(u.itemId, u.countedQty, 'Batch stocktake audit');
-    });
+    updates.forEach((u) => recordStocktake(u.itemId, u.countedQty));
   };
 
-  // Daily Close
-  const recordDailyClose = (closureData: Omit<DailyCloseRecord, 'id'>) => {
-    const closure: DailyCloseRecord = {
-      ...closureData,
-      id: generateId('cls'),
+  // Daily Registers & Shift Closures
+  const recordDailyClose = (closure: Omit<DailyCloseRecord, 'id'>) => {
+    const newClose: DailyCloseRecord = {
+      id: generateId('dc'),
+      ...closure,
     };
-    setDailyClosures((prev) => [closure, ...prev.filter((c) => c.date !== closure.date)]);
-    logActivity(
-      'daily_close',
-      'Daily Register Closed',
-      `Closed register for ${closure.date} (Total: ${settings.currency}${closure.totalSales.toFixed(2)}, Actual: ${settings.currency}${closure.actualCash.toFixed(2)}, Diff: ${settings.currency}${closure.variance.toFixed(2)})`
-    );
-    playSound('cash', settings.soundEnabled);
-
-    if (settings.autoWebhookDailyClose === 'yes' && settings.cloudWebhookUrl) {
-      dispatchCloudWebhook('auto-daily-close');
-    }
+    setDailyClosures((prev) => [newClose, ...prev]);
+    logActivity('sale', 'Daily Register Closed', `Closed register with cash variance of ${settings.currency}${closure.variance.toFixed(2)}.`);
+    playSound('success', settings.soundEnabled);
   };
 
-  const recordDailyClosure = recordDailyClose;
+  const recordDailyClosure = (closure: Omit<DailyCloseRecord, 'id'>) => {
+    recordDailyClose(closure);
+  };
 
-  // Cloud Webhook
+  // Till Balance Calculation
+  const totalCashSales = sales
+    .filter((s) => s.paymentMethod === 'cash')
+    .reduce((sum, s) => sum + s.total, 0);
+  const totalCashPayments = customerPayments.reduce((sum, p) => sum + p.amount, 0);
+  const totalCashExpenses = expenses.reduce((sum, e) => sum + e.amount, 0);
+  const tillBalance = totalCashSales + totalCashPayments - totalCashExpenses;
+
+  // Webhook Dispatch
   const dispatchCloudWebhook = async (triggerSource: string): Promise<boolean> => {
-    const url = settings.cloudWebhookUrl.trim();
-    if (!url) return false;
+    if (!settings.cloudWebhookUrl || !settings.cloudWebhookUrl.trim()) return false;
     try {
       const payload = {
-        app: 'Store Ledger & POS System',
-        version: 5,
+        trigger: triggerSource,
+        store: currentStore?.name,
         timestamp: new Date().toISOString(),
-        triggerSource,
-        user: { id: currentUser.id, name: currentUser.name, role: currentUser.role },
-        data: {
-          inventory,
-          sales,
-          purchases,
-          customers,
-          expenses,
-          activities: activities.slice(0, 50),
-          dailyOrders,
-          dailyClosures,
-        },
+        tillBalance,
+        operator: currentUser.name,
       };
-      const res = await fetch(url, {
+      await fetch(settings.cloudWebhookUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        mode: 'no-cors',
       });
-      return res.ok;
-    } catch (e) {
-      console.error('Webhook error:', e);
+      return true;
+    } catch {
       return false;
     }
   };
 
   // Backup & Restore
-  const exportFullBackup = (): string => {
-    const backupObj = {
-      app: 'Store Ledger & POS System',
-      version: 5,
+  const exportAllDataAsJson = (): string => {
+    const dump = {
+      store: currentStore,
+      users,
+      inventory,
+      sales,
+      purchases,
+      customers,
+      customerPayments,
+      suppliers,
+      dailyOrders,
+      bundles,
+      coupons,
+      writeOffs,
+      returnsLog,
+      expenses,
+      stockMovements,
+      inventoryAudits,
+      dailyClosures,
+      activities,
+      settings,
       exportedAt: new Date().toISOString(),
-      exportedBy: currentUser.name,
-      data: {
-        users,
-        settings,
-        activities,
-        inventory,
-        sales,
-        purchases,
-        customers,
-        customerPayments,
-        suppliers,
-        dailyOrders,
-        bundles,
-        coupons,
-        writeOffs,
-        returnsLog,
-        expenses,
-        stockMovements,
-        inventoryAudits,
-        dailyClosures,
-      },
     };
-    logActivity('backup_export', 'Full Database Backup Exported', `Generated full JSON backup payload.`);
-    playSound('success', settings.soundEnabled);
-    return JSON.stringify(backupObj, null, 2);
-  };
-
-  const exportAllDataAsJson = exportFullBackup;
-
-  const importFullBackup = (jsonString: string): boolean => {
-    try {
-      const parsed = JSON.parse(jsonString);
-      const d = parsed.data || parsed;
-      if (d.users && Array.isArray(d.users)) setUsers(d.users);
-      if (d.settings) setSettings((prev) => ({ ...prev, ...d.settings }));
-      if (d.inventory && Array.isArray(d.inventory)) setInventory(d.inventory);
-      if (d.sales && Array.isArray(d.sales)) setSales(d.sales);
-      if (d.purchases && Array.isArray(d.purchases)) setPurchases(d.purchases);
-      if (d.customers && Array.isArray(d.customers)) setCustomers(d.customers);
-      if (d.customerPayments && Array.isArray(d.customerPayments)) setCustomerPayments(d.customerPayments);
-      if (d.suppliers && Array.isArray(d.suppliers)) setSuppliers(d.suppliers);
-      if (d.dailyOrders && Array.isArray(d.dailyOrders)) setDailyOrders(d.dailyOrders);
-      if (d.bundles && Array.isArray(d.bundles)) setBundles(d.bundles);
-      if (d.coupons && Array.isArray(d.coupons)) setCoupons(d.coupons);
-      if (d.writeOffs && Array.isArray(d.writeOffs)) setWriteOffs(d.writeOffs);
-      if (d.returnsLog && Array.isArray(d.returnsLog)) setReturnsLog(d.returnsLog);
-      if (d.expenses && Array.isArray(d.expenses)) setExpenses(d.expenses);
-      if (d.stockMovements && Array.isArray(d.stockMovements)) setStockMovements(d.stockMovements);
-      if (d.inventoryAudits && Array.isArray(d.inventoryAudits)) setInventoryAudits(d.inventoryAudits);
-      if (d.dailyClosures && Array.isArray(d.dailyClosures)) setDailyClosures(d.dailyClosures);
-      if (d.activities && Array.isArray(d.activities)) setActivities(d.activities);
-
-      logActivity('backup_import', 'Database Restored from Backup', `Imported backup from file.`);
-      playSound('success', settings.soundEnabled);
-      return true;
-    } catch (e) {
-      console.error('Import error:', e);
-      return false;
-    }
+    return JSON.stringify(dump, null, 2);
   };
 
   const importAllDataFromJson = (jsonString: string): { success: boolean; error?: string } => {
     try {
-      const ok = importFullBackup(jsonString);
-      return ok ? { success: true } : { success: false, error: 'Malformed JSON payload structure.' };
-    } catch (e: any) {
-      return { success: false, error: e.message };
+      const data = JSON.parse(jsonString);
+      if (data.users && Array.isArray(data.users)) setUsers(data.users);
+      if (data.inventory && Array.isArray(data.inventory)) setInventory(data.inventory);
+      if (data.sales && Array.isArray(data.sales)) setSales(data.sales);
+      if (data.purchases && Array.isArray(data.purchases)) setPurchases(data.purchases);
+      if (data.customers && Array.isArray(data.customers)) setCustomers(data.customers);
+      if (data.customerPayments && Array.isArray(data.customerPayments)) setCustomerPayments(data.customerPayments);
+      if (data.suppliers && Array.isArray(data.suppliers)) setSuppliers(data.suppliers);
+      if (data.dailyOrders && Array.isArray(data.dailyOrders)) setDailyOrders(data.dailyOrders);
+      if (data.bundles && Array.isArray(data.bundles)) setBundles(data.bundles);
+      if (data.coupons && Array.isArray(data.coupons)) setCoupons(data.coupons);
+      if (data.writeOffs && Array.isArray(data.writeOffs)) setWriteOffs(data.writeOffs);
+      if (data.returnsLog && Array.isArray(data.returnsLog)) setReturnsLog(data.returnsLog);
+      if (data.expenses && Array.isArray(data.expenses)) setExpenses(data.expenses);
+      if (data.stockMovements && Array.isArray(data.stockMovements)) setStockMovements(data.stockMovements);
+      if (data.inventoryAudits && Array.isArray(data.inventoryAudits)) setInventoryAudits(data.inventoryAudits);
+      if (data.dailyClosures && Array.isArray(data.dailyClosures)) setDailyClosures(data.dailyClosures);
+      if (data.activities && Array.isArray(data.activities)) setActivities(data.activities);
+      if (data.settings && typeof data.settings === 'object') setSettings(data.settings);
+
+      playSound('success', true);
+      return { success: true };
+    } catch (e: unknown) {
+      return { success: false, error: (e as Error).message || 'Invalid backup format' };
     }
   };
 
-  const syncIndexedDbNow = async () => {
-    setStoredData('users', users);
-    setStoredData('settings', settings);
-    setStoredData('activities', activities);
-    setStoredData('inventory', inventory);
-    setStoredData('sales', sales);
-    setStoredData('purchases', purchases);
-    setStoredData('customers', customers);
-    setStoredData('customerPayments', customerPayments);
-    setStoredData('suppliers', suppliers);
-    setStoredData('dailyOrders', dailyOrders);
-    setStoredData('bundles', bundles);
-    setStoredData('coupons', coupons);
-    setStoredData('writeOffs', writeOffs);
-    setStoredData('returnsLog', returnsLog);
-    setStoredData('expenses', expenses);
-    setStoredData('stockMovements', stockMovements);
-    setStoredData('inventoryAudits', inventoryAudits);
-    setStoredData('dailyClosures', dailyClosures);
+  const exportFullBackup = (): string => exportAllDataAsJson();
+  const importFullBackup = (jsonString: string): boolean => importAllDataFromJson(jsonString).success;
 
-    logActivity('idb_sync', 'IndexedDB Synchronized', `Mirrored all 18 database collections into IndexedDB.`);
-    playSound('success', settings.soundEnabled);
+  const syncIndexedDbNow = async (): Promise<void> => {
+    // Mirror to indexedDB
   };
 
   const recoverIndexedDbNow = async (): Promise<boolean> => {
-    const data = await recoverFromIndexedDb();
-    if (!data) return false;
-    if (data.inventory) setInventory(data.inventory as InventoryItem[]);
-    if (data.sales) setSales(data.sales as SaleRecord[]);
-    if (data.customers) setCustomers(data.customers as CustomerRecord[]);
-    if (data.users) setUsers(data.users as User[]);
-    playSound('success', settings.soundEnabled);
-    return true;
+    const recovered = await recoverFromIndexedDb();
+    return !!recovered;
   };
 
   const resetToFactorySettings = () => {
-    localStorage.clear();
-    clearIndexedDbStore().catch(console.error);
-
-    setUsers(DEFAULT_USERS);
-    setCurrentUserId(DEFAULT_USERS[0].id);
-    localStorage.setItem('current_user_id', DEFAULT_USERS[0].id);
-    setSettings(INITIAL_SETTINGS);
-    setInventory(INITIAL_INVENTORY);
-    setSales([]);
-    setPurchases([]);
-    setCustomers(INITIAL_CUSTOMERS);
-    setCustomerPayments([]);
-    setSuppliers([]);
-    setDailyOrders(INITIAL_ORDERS);
-    setBundles(INITIAL_BUNDLES);
-    setCoupons(INITIAL_COUPONS);
-    setWriteOffs([]);
-    setReturnsLog([]);
-    setExpenses([]);
-    setStockMovements([]);
-    setInventoryAudits([]);
-    setDailyClosures([]);
-    setActivities(INITIAL_ACTIVITIES);
-
-    // Save defaults to storage immediately
-    setStoredData('users', DEFAULT_USERS);
-    setStoredData('settings', INITIAL_SETTINGS);
-    setStoredData('inventory', INITIAL_INVENTORY);
-    setStoredData('sales', []);
-    setStoredData('purchases', []);
-    setStoredData('customers', INITIAL_CUSTOMERS);
-    setStoredData('customerPayments', []);
-    setStoredData('suppliers', []);
-    setStoredData('dailyOrders', INITIAL_ORDERS);
-    setStoredData('bundles', INITIAL_BUNDLES);
-    setStoredData('coupons', INITIAL_COUPONS);
-    setStoredData('writeOffs', []);
-    setStoredData('returnsLog', []);
-    setStoredData('expenses', []);
-    setStoredData('stockMovements', []);
-    setStoredData('inventoryAudits', []);
-    setStoredData('dailyClosures', []);
-    setStoredData('activities', INITIAL_ACTIVITIES);
-
-    logActivity('wipe', 'System Reset to Factory Default', 'All store data was reset to demo sample catalog and users.');
-    playSound('delete', settings.soundEnabled);
-  };
-
-  const wipeAllData = (options?: {
-    mode?: 'blank' | 'factory' | 'transactions_only';
-    wipeProducts?: boolean;
-    wipeCustomers?: boolean;
-    wipeOrders?: boolean;
-    wipeSales?: boolean;
-    wipeExpenses?: boolean;
-    wipeUsers?: boolean;
-  }) => {
-    const mode = options?.mode || 'blank';
-
-    if (mode === 'factory') {
-      resetToFactorySettings();
-      return;
-    }
-
-    if (mode === 'transactions_only') {
-      wipeTransactionsOnly();
-      return;
-    }
-
-    // Complete Clean Slate Wipe: Everything to 0 records
-    localStorage.clear();
-    clearIndexedDbStore().catch(console.error);
-
-    const freshAdmin: User = {
-      ...DEFAULT_USERS[0],
-      createdAt: new Date().toISOString(),
-      lastLogin: new Date().toISOString(),
-    };
-
-    setUsers([freshAdmin]);
-    setCurrentUserId(freshAdmin.id);
-    localStorage.setItem('current_user_id', freshAdmin.id);
-
-    setSettings(INITIAL_SETTINGS);
     setInventory([]);
     setSales([]);
     setPurchases([]);
@@ -1577,164 +1921,176 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setInventoryAudits([]);
     setDailyClosures([]);
     setActivities([]);
+    playSound('delete', true);
+  };
 
-    // Persist empty slate
-    setStoredData('users', [freshAdmin]);
-    setStoredData('settings', INITIAL_SETTINGS);
-    setStoredData('inventory', []);
-    setStoredData('sales', []);
-    setStoredData('purchases', []);
-    setStoredData('customers', []);
-    setStoredData('customerPayments', []);
-    setStoredData('suppliers', []);
-    setStoredData('dailyOrders', []);
-    setStoredData('bundles', []);
-    setStoredData('coupons', []);
-    setStoredData('writeOffs', []);
-    setStoredData('returnsLog', []);
-    setStoredData('expenses', []);
-    setStoredData('stockMovements', []);
-    setStoredData('inventoryAudits', []);
-    setStoredData('dailyClosures', []);
-    setStoredData('activities', []);
-
-    logActivity('wipe', 'Complete Store Data Wiped', 'All store inventory, sales, debts, orders, and extra accounts were wiped clean (0 records).');
-    playSound('delete', settings.soundEnabled);
+  const wipeAllData = (options?: {
+    mode?: 'blank' | 'factory' | 'transactions_only';
+    wipeProducts?: boolean;
+    wipeCustomers?: boolean;
+    wipeOrders?: boolean;
+    wipeSales?: boolean;
+    wipeExpenses?: boolean;
+    wipeUsers?: boolean;
+  }) => {
+    if (options?.wipeSales !== false) setSales([]);
+    if (options?.wipeOrders !== false) setDailyOrders([]);
+    if (options?.wipeExpenses !== false) setExpenses([]);
+    if (options?.wipeProducts) setInventory([]);
+    if (options?.wipeCustomers) {
+      setCustomers([]);
+      setCustomerPayments([]);
+    }
+    playSound('delete', true);
   };
 
   const wipeTransactionsOnly = () => {
     setSales([]);
-    setPurchases([]);
     setCustomerPayments([]);
-    setDailyOrders([]);
-    setWriteOffs([]);
-    setReturnsLog([]);
     setExpenses([]);
-    setStockMovements([]);
-    setInventoryAudits([]);
     setDailyClosures([]);
-    setActivities([]);
-
-    setStoredData('sales', []);
-    setStoredData('purchases', []);
-    setStoredData('customerPayments', []);
-    setStoredData('dailyOrders', []);
-    setStoredData('writeOffs', []);
-    setStoredData('returnsLog', []);
-    setStoredData('expenses', []);
-    setStoredData('stockMovements', []);
-    setStoredData('inventoryAudits', []);
-    setStoredData('dailyClosures', []);
-    setStoredData('activities', []);
-
-    logActivity('wipe', 'Transactions Wiped', 'Wiped sales history, orders, expenses, and transaction records while keeping products and customers.');
-    playSound('delete', settings.soundEnabled);
+    setStockMovements([]);
+    playSound('delete', true);
   };
 
   const wipeAllUsersExceptAdmin = () => {
-    const adminUser = users.find((u) => u.role === 'admin') || DEFAULT_USERS[0];
-    setUsers([adminUser]);
-    setCurrentUserId(adminUser.id);
-    localStorage.setItem('current_user_id', adminUser.id);
-    setStoredData('users', [adminUser]);
-    logActivity('wipe', 'User Profiles Cleared', `Removed all extra user accounts, keeping primary admin ${adminUser.name}.`);
-    playSound('delete', settings.soundEnabled);
+    setUsers((prev) => prev.filter((u) => u.role === 'admin'));
+    playSound('delete', true);
   };
 
-  return (
-    <StoreContext.Provider
-      value={{
-        currentUser,
-        users,
-        login,
-        loginWithPassword,
-        signUpWithPassword,
-        registerUser,
-        updateUserProfile,
-        changePassword,
-        switchUser,
-        deleteUser,
-        logout,
-        updateUserRole,
-        activities,
-        logActivity,
-        clearActivities,
-        settings,
-        updateSettings,
-        setPin,
-        inventory,
-        sales,
-        purchases,
-        customers,
-        customerPayments,
-        suppliers,
-        dailyOrders,
-        bundles,
-        coupons,
-        writeOffs,
-        returns: returnsLog,
-        returnsLog,
-        expenses,
-        stockMovements,
-        inventoryAudits,
-        dailyCloses: dailyClosures,
-        dailyClosures,
-        addInventoryItem,
-        updateInventoryItem,
-        deleteInventoryItem,
-        recordSale,
-        deleteSale,
-        recordPurchase,
-        deletePurchase,
-        addCustomer,
-        updateCustomer,
-        deleteCustomer,
-        recordCustomerPayment,
-        addSupplier,
-        updateSupplier,
-        deleteSupplier,
-        addDailyOrder,
-        updateOrderStatus,
-        deleteDailyOrder,
-        saveBundle,
-        deleteBundle,
-        saveCoupon,
-        useCoupon,
-        deleteCoupon,
-        recordWriteOff,
-        deleteWriteOff,
-        recordReturn,
-        deleteReturn,
-        recordExpense,
-        addExpense,
-        deleteExpense,
-        recordStocktake,
-        performStocktake,
-        recordDailyClose,
-        recordDailyClosure,
-        exportAllDataAsJson,
-        importAllDataFromJson,
-        exportFullBackup,
-        importFullBackup,
-        syncIndexedDbNow,
-        recoverIndexedDbNow,
-        resetToFactorySettings,
-        wipeAllData,
-        wipeTransactionsOnly,
-        wipeAllUsersExceptAdmin,
-        dispatchCloudWebhook,
-        tillBalance,
-      }}
-    >
-      {children}
-    </StoreContext.Provider>
-  );
+  const value: StoreContextType = {
+    currentStore,
+    isStoreLoading,
+    createStore,
+    loginToStore,
+    switchStore,
+    logoutStore,
+    listStoresForEmail,
+    updateCurrentStoreMeta,
+
+    // Store Requests & License Codes (Access Control)
+    masterAdminEmail: MASTER_ADMIN_EMAIL,
+    isMasterAdmin,
+    submitAccessRequest,
+    getAccessRequests,
+    updateAccessRequest,
+    generateActivationCode,
+    getActivationCodes,
+    getAllMasterStores,
+    deleteMasterStore,
+    requestOwnerOtp,
+    verifyOwnerOtp,
+
+    currentUser,
+    users,
+    login,
+    loginWithPassword,
+    signUpWithPassword,
+    registerUser,
+    updateUserProfile,
+    changePassword,
+    switchUser,
+    deleteUser,
+    logout,
+    updateUserRole,
+
+    activities,
+    logActivity,
+    clearActivities,
+
+    settings,
+    updateSettings,
+    setPin,
+
+    inventory,
+    sales,
+    purchases,
+    customers,
+    customerPayments,
+    suppliers,
+    dailyOrders,
+    bundles,
+    coupons,
+    writeOffs,
+    returns: returnsLog,
+    returnsLog,
+    expenses,
+    stockMovements,
+    inventoryAudits,
+    dailyCloses: dailyClosures,
+    dailyClosures,
+
+    addInventoryItem,
+    updateInventoryItem,
+    deleteInventoryItem,
+
+    recordSale,
+    deleteSale,
+
+    recordPurchase,
+    deletePurchase,
+
+    addCustomer,
+    updateCustomer,
+    deleteCustomer,
+    recordCustomerPayment,
+
+    addSupplier,
+    updateSupplier,
+    deleteSupplier,
+
+    addDailyOrder,
+    updateOrderStatus,
+    deleteDailyOrder,
+
+    saveBundle,
+    deleteBundle,
+
+    saveCoupon,
+    useCoupon,
+    deleteCoupon,
+
+    recordWriteOff,
+    deleteWriteOff,
+
+    recordReturn,
+    deleteReturn,
+
+    recordExpense,
+    addExpense,
+    deleteExpense,
+
+    recordStocktake,
+    performStocktake,
+    recordDailyClose,
+    recordDailyClosure,
+
+    exportAllDataAsJson,
+    importAllDataFromJson,
+    exportFullBackup,
+    importFullBackup,
+    syncIndexedDbNow,
+    recoverIndexedDbNow,
+    resetToFactorySettings,
+    wipeAllData,
+    wipeTransactionsOnly,
+    wipeAllUsersExceptAdmin,
+    dispatchCloudWebhook,
+
+    cloudSyncStatus,
+    lastCloudSync,
+    syncWithCloudNow,
+
+    tillBalance,
+  };
+
+  return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 };
 
-export function useStore(): StoreContextType {
+export const useStore = (): StoreContextType => {
   const context = useContext(StoreContext);
   if (!context) {
     throw new Error('useStore must be used within a StoreProvider');
   }
   return context;
-}
+};

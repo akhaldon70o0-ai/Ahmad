@@ -11,6 +11,7 @@ import { Sidebar } from './components/Sidebar';
 import { AuthModal } from './components/AuthModal';
 import { BarcodeScannerModal } from './components/BarcodeScannerModal';
 import { MasterLockScreen, isMasterUnlocked, lockMasterApp } from './components/MasterLockScreen';
+import { MultiStorePortal } from './components/MultiStorePortal';
 
 import { DashboardView } from './views/DashboardView';
 import { SalesPosView } from './views/SalesPosView';
@@ -35,15 +36,23 @@ import { BackupRestoreView } from './views/BackupRestoreView';
 import { MigrationView } from './views/MigrationView';
 
 function MainApp() {
+  const { currentStore, inventory, addInventoryItem, logoutStore } = useStore();
   const [isUnlocked, setIsUnlocked] = useState<boolean>(isMasterUnlocked());
   const [currentView, setCurrentView] = useState<AppView>('dashboard');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [bundleInitialItem, setBundleInitialItem] = useState<string | undefined>(undefined);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const { inventory, currentUser, addInventoryItem } = useStore();
+  // If no store is selected or active, show the MultiStorePortal
+  if (!currentStore) {
+    return <MultiStorePortal />;
+  }
+
+  // If locked, render the master lock screen
+  if (!isUnlocked) {
+    return <MasterLockScreen onUnlock={() => setIsUnlocked(true)} />;
+  }
 
   const handleScanBarcode = (barcode: string) => {
     // Check if barcode belongs to item
@@ -81,11 +90,6 @@ function MainApp() {
     lockMasterApp();
     setIsUnlocked(false);
   };
-
-  // If not unlocked with password AK7.0O0, render the master lock screen
-  if (!isUnlocked) {
-    return <MasterLockScreen onUnlock={() => setIsUnlocked(true)} />;
-  }
 
   return (
     <div className="flex h-screen w-full bg-slate-50 font-sans text-slate-900 overflow-hidden selection:bg-blue-500 selection:text-white">

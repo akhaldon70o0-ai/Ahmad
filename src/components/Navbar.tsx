@@ -15,6 +15,11 @@ import {
   Search,
   User as UserIcon,
   Lock,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  Smartphone,
+  Store,
 } from 'lucide-react';
 
 interface NavbarProps {
@@ -34,8 +39,27 @@ export const Navbar: React.FC<NavbarProps> = ({
   onSelectView,
   onLockApp,
 }) => {
-  const { currentUser, settings, updateSettings, tillBalance, activities, logout } = useStore();
+  const {
+    currentStore,
+    currentUser,
+    settings,
+    updateSettings,
+    tillBalance,
+    activities,
+    logout,
+    logoutStore,
+    cloudSyncStatus,
+    syncWithCloudNow,
+    lastCloudSync,
+  } = useStore();
   const [showUserDropdown, setShowUserDropdown] = useState(false);
+  const [isManualSyncing, setIsManualSyncing] = useState(false);
+
+  const handleManualSync = async () => {
+    setIsManualSyncing(true);
+    await syncWithCloudNow();
+    setTimeout(() => setIsManualSyncing(false), 600);
+  };
 
   // Count user's own activities
   const userActCount = activities.filter((a) => a.userId === currentUser.id).length;
@@ -166,6 +190,33 @@ export const Navbar: React.FC<NavbarProps> = ({
           </button>
         )}
 
+        {/* Real-time Multi-Device Cloud Sync Indicator */}
+        <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 bg-white shadow-xs">
+          <button
+            onClick={handleManualSync}
+            disabled={isManualSyncing}
+            className="flex items-center gap-1.5 text-xs font-medium text-slate-700 hover:text-blue-600 transition-colors disabled:opacity-60"
+            title={lastCloudSync ? `Multi-device cloud synced at ${new Date(lastCloudSync).toLocaleTimeString()}` : 'Real-time multi-device cloud synchronization'}
+          >
+            {cloudSyncStatus === 'syncing' || isManualSyncing ? (
+              <>
+                <RefreshCw className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+                <span className="text-[11px] font-bold text-blue-700">Syncing...</span>
+              </>
+            ) : cloudSyncStatus === 'synced' ? (
+              <>
+                <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                <span className="text-[11px] font-bold text-emerald-700">Cloud Synced</span>
+              </>
+            ) : (
+              <>
+                <CloudOff className="w-3.5 h-3.5 text-amber-500" />
+                <span className="text-[11px] font-bold text-amber-700">Offline / Sync</span>
+              </>
+            )}
+          </button>
+        </div>
+
         {/* Net Till Position Indicator */}
         <div className="bg-slate-50 border border-slate-200 rounded-lg px-3 py-1 text-right hidden md:block">
           <div className="text-[9px] uppercase font-bold tracking-wider text-slate-500">Till Balance</div>
@@ -173,6 +224,17 @@ export const Navbar: React.FC<NavbarProps> = ({
             {formatMoney(tillBalance, settings.currency)}
           </div>
         </div>
+
+        {/* Store Identifier Pill */}
+        {currentStore && (
+          <div
+            className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-xs font-semibold text-slate-800"
+            title={`Active Store Partition: ${currentStore.name} (${currentStore.ownerEmail})`}
+          >
+            <Store className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+            <span className="max-w-[130px] truncate font-bold">{currentStore.name}</span>
+          </div>
+        )}
 
         {/* User Account Button with Dropdown */}
         <div className="relative">
@@ -195,12 +257,17 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {showUserDropdown && (
             <div
-              className="absolute right-0 mt-2 w-56 bg-white rounded-xl shadow-xl border border-slate-200 py-2 z-50 animate-in fade-in slide-in-from-top-2 duration-150"
+              className="absolute right-0 mt-2 w-60 bg-white rounded-xl shadow-xl border border-slate-200 py-2 z-50 animate-in fade-in slide-in-from-top-2 duration-150"
               onMouseLeave={() => setShowUserDropdown(false)}
             >
               <div className="px-3.5 py-2.5 border-b border-slate-100">
                 <p className="text-xs font-bold text-slate-900">{currentUser.name}</p>
                 <p className="text-[11px] text-slate-500 truncate">{currentUser.email}</p>
+                {currentStore && (
+                  <p className="text-[10px] text-blue-600 font-semibold truncate mt-0.5">
+                    Store: {currentStore.name}
+                  </p>
+                )}
                 <span className="inline-block mt-1 text-[10px] uppercase tracking-wider font-extrabold px-2 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
                   {currentUser.role} Account
                 </span>
@@ -239,7 +306,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                   className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-2"
                 >
                   <ArrowRightLeft className="w-4 h-4 text-slate-500" />
-                  Switch User Account
+                  Switch Cashier Account
                 </button>
                 <button
                   onClick={() => {
@@ -249,11 +316,22 @@ export const Navbar: React.FC<NavbarProps> = ({
                   className="w-full px-3.5 py-2 text-left text-xs font-medium text-blue-700 hover:bg-blue-50 flex items-center gap-2"
                 >
                   <UserPlus className="w-4 h-4 text-blue-600" />
-                  Register New User
+                  Add Staff Member
                 </button>
               </div>
 
               <div className="pt-1 border-t border-slate-100 space-y-0.5">
+                <button
+                  onClick={() => {
+                    setShowUserDropdown(false);
+                    logoutStore();
+                  }}
+                  className="w-full px-3.5 py-2 text-left text-xs font-semibold text-indigo-700 hover:bg-indigo-50 flex items-center gap-2 transition-colors"
+                  title="Return to multi-store selection portal"
+                >
+                  <Store className="w-4 h-4 text-indigo-600" />
+                  Switch / Change Store
+                </button>
                 {onLockApp && (
                   <button
                     onClick={() => {

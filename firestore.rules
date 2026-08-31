@@ -1,0 +1,50 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Registered stores directory
+    match /stores/{storeId} {
+      allow read, write: if true;
+    }
+
+    // User-to-store lookup directory
+    match /store_users/{emailClean} {
+      allow read, write: if true;
+    }
+
+    // Isolated store data documents synced per store
+    match /store_data/{storeId} {
+      allow read, write: if true;
+    }
+    
+    // User profile documents
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // Store Access Requests
+    match /store_requests/{requestId} {
+      allow read, write: if true;
+    }
+
+    // Activation License Keys
+    match /activation_codes/{codeId} {
+      allow read, write: if true;
+    }
+
+    // Owner Verification OTP Codes
+    match /owner_verification_codes/{emailClean} {
+      allow read, write: if true;
+    }
+
+    // Email dispatch queue (Firebase Trigger Email extension)
+    match /mail/{mailId} {
+      allow create: if true;
+      allow read, write: if true;
+    }
+
+    // General fallback rule
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

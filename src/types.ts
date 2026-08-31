@@ -1,5 +1,71 @@
 export type UserRole = 'admin' | 'manager' | 'cashier' | 'stockkeeper';
 
+export interface StoreMeta {
+  id: string;
+  name: string;
+  ownerEmail: string;
+  ownerName: string;
+  currency: string;
+  adminPin?: string;
+  createdAt: string;
+  lastActive?: string;
+  passwordHash?: string;
+  passwordSalt?: string;
+  description?: string;
+  activationCode?: string;
+  isApproved?: boolean;
+}
+
+export interface StoreAccessRequest {
+  id: string;
+  businessName: string;
+  contactName: string;
+  contactEmail: string;
+  contactPhone: string;
+  currency: string;
+  notes?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  generatedCode?: string;
+}
+
+export interface ActivationCode {
+  id: string;
+  code: string;
+  createdForEmail?: string;
+  createdForBusiness?: string;
+  isUsed: boolean;
+  usedByStoreId?: string;
+  usedAt?: string;
+  createdAt: string;
+  createdBy: string;
+  notes?: string;
+}
+
+export interface OwnerVerificationCode {
+  email: string;
+  code: string;
+  createdAt: string;
+  expiresAt: string;
+  isUsed: boolean;
+  attempts: number;
+}
+
+export interface StoreUserRecord {
+  email: string;
+  username: string;
+  name: string;
+  role: UserRole;
+  storeId: string;
+  storeName: string;
+  passwordHash?: string;
+  passwordSalt?: string;
+  pin?: string;
+  lastLogin?: string;
+}
+
 export type AppView =
   | 'dashboard'
   | 'sales'
@@ -164,6 +230,8 @@ export interface CustomerRecord {
   address?: string;
   notes?: string;
   createdAt?: string;
+  totalDebt?: number;
+  creditLimit?: number;
 }
 
 export interface CustomerPayment {

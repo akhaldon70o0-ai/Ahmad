@@ -44,7 +44,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onClose,
   onOpenAuth,
 }) => {
-  const { settings, updateSettings, currentUser } = useStore();
+  const { settings, updateSettings, currentUser, currentStore, logoutStore } = useStore();
 
   const isCashier = currentUser.role === 'cashier';
 
@@ -98,21 +98,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <span className="text-base font-semibold text-white tracking-tight block truncate">
                 {settings.storeName || 'Store Ledger'}
               </span>
-              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                Professional POS
+              <span className="text-[10px] font-bold text-blue-400 uppercase tracking-wider block truncate">
+                {currentStore?.ownerEmail || 'Cloud Store'}
               </span>
             </div>
           </div>
 
-          <div className="mt-3.5">
+          <div className="mt-3 flex items-center gap-1.5">
             <input
               type="text"
               value={settings.storeName}
               onChange={(e) => updateSettings({ storeName: e.target.value })}
               placeholder="Edit Store Name..."
-              className="w-full px-2.5 py-1.5 bg-slate-950/60 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-medium"
+              className="flex-1 px-2.5 py-1.5 bg-slate-950/60 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-medium"
               title="Edit Store Title"
             />
+            <button
+              onClick={logoutStore}
+              className="px-2 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg text-[11px] font-semibold border border-slate-700 transition-colors shrink-0"
+              title="Switch Store Workspace"
+            >
+              Switch
+            </button>
           </div>
         </div>
 
