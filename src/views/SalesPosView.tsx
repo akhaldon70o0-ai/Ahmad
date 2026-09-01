@@ -57,7 +57,9 @@ export const SalesPosView: React.FC = () => {
   const [cart, setCart] = useState<CartItem[]>([]);
   const [editingSaleId, setEditingSaleId] = useState<string | null>(null);
   const [statusMsg, setStatusMsg] = useState<string>('');
+  const [errorMsg, setErrorMsg] = useState<string>('');
   const [historySearch, setHistorySearch] = useState<string>('');
+  const [saleToDelete, setSaleToDelete] = useState<SaleRecord | null>(null);
 
   const isCashier = currentUser.role === 'cashier';
 
@@ -90,11 +92,12 @@ export const SalesPosView: React.FC = () => {
     }
   };
 
-  // Quick Barcode Scanning Handler
+  // Fast Barcode Detected
   const handleBarcodeDetected = (code: string) => {
     const clean = code.trim();
     if (!clean) return;
 
+    setErrorMsg('');
     const found = inventory.find(
       (i) => (i.barcode && i.barcode.trim() === clean) || i.name.toLowerCase() === clean.toLowerCase()
     );
@@ -128,30 +131,36 @@ export const SalesPosView: React.FC = () => {
       setStatusMsg(`Added: ${found.name}`);
       setTimeout(() => setStatusMsg(''), 2500);
     } else {
-      alert(`No product found in catalog with barcode: "${clean}"`);
+      setErrorMsg(`No product found in catalog with barcode: "${clean}"`);
+      setTimeout(() => setErrorMsg(''), 4000);
     }
   };
 
   // Apply Promo Coupon
   const handleApplyCoupon = () => {
+    setErrorMsg('');
     const code = promoCodeInput.trim().toUpperCase();
     if (!code) return;
 
     const coupon = coupons.find((c) => c.code.toUpperCase() === code);
     if (!coupon) {
-      alert('Promo code not found.');
+      setErrorMsg('Promo code not found.');
+      setTimeout(() => setErrorMsg(''), 3500);
       return;
     }
     if (!coupon.active) {
-      alert('This coupon is currently inactive.');
+      setErrorMsg('This coupon is currently inactive.');
+      setTimeout(() => setErrorMsg(''), 3500);
       return;
     }
     if (coupon.expiry && coupon.expiry < getTodayDateString()) {
-      alert('This promo code has expired.');
+      setErrorMsg('This promo code has expired.');
+      setTimeout(() => setErrorMsg(''), 3500);
       return;
     }
     if (coupon.limit && coupon.usedCount >= coupon.limit) {
-      alert('This promo code has reached its maximum usage limit.');
+      setErrorMsg('This promo code has reached its maximum usage limit.');
+      setTimeout(() => setErrorMsg(''), 3500);
       return;
     }
 
@@ -165,11 +174,20 @@ export const SalesPosView: React.FC = () => {
 
   // Add Item to Cart
   const handleAddToCart = () => {
+    setErrorMsg('');
     const clean = selectedItemName.trim();
-    if (!clean) return alert('Select or type a product name.');
+    if (!clean) {
+      setErrorMsg('Please select or type a product name.');
+      setTimeout(() => setErrorMsg(''), 3000);
+      return;
+    }
 
     const priceNum = parseFloat(itemPrice);
-    if (isNaN(priceNum) || priceNum < 0) return alert('Enter a valid selling price.');
+    if (isNaN(priceNum) || priceNum < 0) {
+      setErrorMsg('Please enter a valid selling price.');
+      setTimeout(() => setErrorMsg(''), 3000);
+      return;
+    }
 
     const qtyNum = Math.max(1, itemQty);
     const costNum = itemCost !== '' ? parseFloat(itemCost) : null;
@@ -246,7 +264,11 @@ export const SalesPosView: React.FC = () => {
 
   // Complete Sale
   const handleCompleteSale = () => {
-    if (cart.length === 0) return alert('Cart is empty. Add at least one item.');
+    if (cart.length === 0) {
+      setErrorMsg('Cart is empty. Add at least one item.');
+      setTimeout(() => setErrorMsg(''), 3000);
+      return;
+    }
 
     if (appliedPromo) {
       useCoupon(appliedPromo.code);
@@ -281,8 +303,8 @@ export const SalesPosView: React.FC = () => {
     setAppliedPromo(null);
     setInvoiceDiscountType('none');
     setInvoiceDiscountValue(0);
-    setStatusMsg('Sale completed successfully!');
-    setTimeout(() => setStatusMsg(''), 3000);
+    setStatusMsg(editingSaleId ? 'Sale modifications saved!' : 'Sale completed successfully!');
+    setTimeout(() => setStatusMsg(''), 3500);
   };
 
   const startEditSale = (s: SaleRecord) => {
@@ -412,12 +434,26 @@ export const SalesPosView: React.FC = () => {
           {editingSaleId && (
             <button
               onClick={cancelEdit}
-              className="px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold"
+              className="px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-bold cursor-pointer"
             >
               Cancel Edit
             </button>
           )}
         </div>
+
+        {/* Status / Error Toast Banners */}
+        {errorMsg && (
+          <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-xs flex items-center justify-between animate-in fade-in">
+            <span>{errorMsg}</span>
+            <button onClick={() => setErrorMsg('')} className="text-rose-500 hover:text-rose-700 font-bold ml-2 cursor-pointer">&times;</button>
+          </div>
+        )}
+        {statusMsg && (
+          <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl text-xs flex items-center justify-between animate-in fade-in">
+            <span className="font-semibold">{statusMsg}</span>
+            <button onClick={() => setStatusMsg('')} className="text-emerald-500 hover:text-emerald-700 font-bold ml-2 cursor-pointer">&times;</button>
+          </div>
+        )}
 
         {/* Invoice Metadata Controls */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -827,13 +863,10 @@ export const SalesPosView: React.FC = () => {
                       <Edit className="w-3.5 h-3.5" />
                     </button>
                     <button
-                      onClick={() => {
-                        if (window.confirm('Delete this invoice? Sold quantities will be restored back to inventory.')) {
-                          deleteSale(s.id);
-                        }
-                      }}
-                      className="p-1.5 text-rose-600 hover:bg-rose-50 rounded-lg border border-rose-200"
-                      title="Delete Sale"
+                      type="button"
+                      onClick={() => setSaleToDelete(s)}
+                      className="p-1.5 text-rose-600 hover:bg-rose-50 rounded-lg border border-rose-200 cursor-pointer transition-colors"
+                      title="Delete / Void Sale"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -861,6 +894,62 @@ export const SalesPosView: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* In-App Delete Sale Confirmation Modal */}
+      {saleToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4 text-left">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Void &amp; Delete Invoice</h3>
+                <p className="text-xs text-slate-500 font-mono">#{saleToDelete.id}</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-rose-50/70 rounded-xl border border-rose-200/80 text-xs text-rose-900 space-y-2">
+              <p className="font-semibold text-rose-800">
+                Are you sure you want to delete this invoice?
+              </p>
+              <div className="bg-white p-2.5 rounded-lg border border-rose-200 space-y-1 font-mono text-[11px] text-slate-700">
+                <div>Customer: <b className="text-slate-900 font-sans">{saleToDelete.customer || 'Walk-in'}</b></div>
+                <div>Date: {saleToDelete.date}</div>
+                <div>Total Amount: <b>{formatMoney(saleToDelete.total, settings.currency)}</b></div>
+                <div>Items: {saleToDelete.items?.map((it) => `${it.itemName} (×${it.qty})`).join(', ')}</div>
+              </div>
+              <p className="text-[11px] text-rose-700 leading-relaxed">
+                Sold items will automatically be returned back to inventory stock, customer balance will be adjusted, and the transaction will be removed from financial reports.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setSaleToDelete(null)}
+                className="flex-1 py-2.5 px-4 rounded-xl border border-slate-200 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-all cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const id = saleToDelete.id;
+                  deleteSale(id);
+                  setSaleToDelete(null);
+                  setStatusMsg(`Invoice #${id} has been voided & deleted.`);
+                  setTimeout(() => setStatusMsg(''), 4000);
+                }}
+                className="flex-1 py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Void &amp; Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

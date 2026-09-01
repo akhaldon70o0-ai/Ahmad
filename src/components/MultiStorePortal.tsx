@@ -20,6 +20,7 @@ import {
   LogIn,
   Coins,
   MessageSquare,
+  MessageCircle,
   Phone,
   Send,
   Copy,
@@ -32,6 +33,9 @@ import {
   Clock,
   ArrowLeft,
   LogOut,
+  Zap,
+  Gift,
+  Flame,
 } from 'lucide-react';
 import { StoreMeta, StoreAccessRequest, ActivationCode } from '../types';
 
@@ -56,6 +60,9 @@ export const MultiStorePortal: React.FC = () => {
     loginToStore,
     listStoresForEmail,
     masterAdminEmail,
+    masterAdminPhone,
+    masterAdminPhoneIntl,
+    masterAdminWhatsapp,
     submitAccessRequest,
     getAccessRequests,
     updateAccessRequest,
@@ -63,11 +70,13 @@ export const MultiStorePortal: React.FC = () => {
     getActivationCodes,
     getAllMasterStores,
     deleteMasterStore,
+    extendStoreTrial,
+    updateCurrentStoreMeta,
     requestOwnerOtp,
     verifyOwnerOtp,
   } = useStore();
 
-  const [activeTab, setActiveTab] = useState<'login' | 'activate' | 'request' | 'admin'>('login');
+  const [activeTab, setActiveTab] = useState<'login' | 'trial' | 'activate' | 'request' | 'admin'>('login');
 
   // ================= SIGN IN STATE =================
   const [loginIdentifier, setLoginIdentifier] = useState('');
@@ -77,6 +86,18 @@ export const MultiStorePortal: React.FC = () => {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [availableStores, setAvailableStores] = useState<StoreMeta[]>([]);
   const [selectedStoreId, setSelectedStoreId] = useState<string>('');
+
+  // ================= 7-DAY FREE TRIAL STATE =================
+  const [trialStoreName, setTrialStoreName] = useState('');
+  const [trialOwnerName, setTrialOwnerName] = useState('');
+  const [trialOwnerEmail, setTrialOwnerEmail] = useState('');
+  const [trialCurrency, setTrialCurrency] = useState('JOD');
+  const [trialPin, setTrialPin] = useState('1234');
+  const [trialPassword, setTrialPassword] = useState('');
+  const [trialConfirmPassword, setTrialConfirmPassword] = useState('');
+  const [showTrialPassword, setShowTrialPassword] = useState(false);
+  const [trialError, setTrialError] = useState('');
+  const [isStartingTrial, setIsStartingTrial] = useState(false);
 
   // ================= ACTIVATE STORE STATE =================
   const [actStoreName, setActStoreName] = useState('');
@@ -137,6 +158,11 @@ export const MultiStorePortal: React.FC = () => {
   // Copy feedback
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
 
+  // Delete Store Modal & Feedback state
+  const [storeToDelete, setStoreToDelete] = useState<StoreMeta | null>(null);
+  const [isDeletingStore, setIsDeletingStore] = useState(false);
+  const [adminBanner, setAdminBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
   // Resend Countdown Timer effect
   useEffect(() => {
     if (resendCountdown > 0) {
@@ -185,6 +211,54 @@ export const MultiStorePortal: React.FC = () => {
     }
   };
 
+  // Handle 7-Day Free Trial Submit
+  const handleStartFreeTrial = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTrialError('');
+
+    if (!trialStoreName.trim()) {
+      setTrialError('Please provide your store / business name.');
+      return;
+    }
+    if (!trialOwnerName.trim()) {
+      setTrialError('Please provide owner / manager name.');
+      return;
+    }
+    if (!trialOwnerEmail.trim() || !trialOwnerEmail.includes('@')) {
+      setTrialError('Please provide a valid owner email.');
+      return;
+    }
+    if (trialPassword && trialPassword.length < 4) {
+      setTrialError('Password must be at least 4 characters.');
+      return;
+    }
+    if (trialPassword !== trialConfirmPassword) {
+      setTrialError('Passwords do not match.');
+      return;
+    }
+
+    setIsStartingTrial(true);
+    try {
+      const res = await createStore({
+        storeName: trialStoreName.trim(),
+        ownerName: trialOwnerName.trim(),
+        ownerEmail: trialOwnerEmail.trim().toLowerCase(),
+        password: trialPassword,
+        pin: trialPin.trim() || '1234',
+        currency: trialCurrency,
+        isTrial: true,
+      });
+
+      if (!res.success) {
+        setTrialError(res.error || 'Failed to start 7-day free trial.');
+      }
+    } catch (err: unknown) {
+      setTrialError((err as Error).message || 'An error occurred while starting trial.');
+    } finally {
+      setIsStartingTrial(false);
+    }
+  };
+
   // Handle Activate Store Submit
   const handleActivateStore = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -203,7 +277,7 @@ export const MultiStorePortal: React.FC = () => {
       return;
     }
     if (!actLicenseCode.trim()) {
-      setActError('An Activation License Key is strictly required. Please contact the administrator at ' + masterAdminEmail + ' to obtain one.');
+      setActError(`An Activation License Key is strictly required. Please contact administrator Khaldon at ${masterAdminEmail} or WhatsApp ${masterAdminPhone} to obtain one.`);
       return;
     }
     if (actPassword && actPassword.length < 4) {
@@ -269,7 +343,7 @@ export const MultiStorePortal: React.FC = () => {
       if (res.success) {
         setReqSubmitted(res.id);
       } else {
-        setReqError(res.error || 'Failed to submit request. Please reach out to ' + masterAdminEmail + ' directly.');
+        setReqError(res.error || `Failed to submit request. Please reach out to ${masterAdminEmail} or WhatsApp ${masterAdminPhone} directly.`);
       }
     } catch (err: unknown) {
       setReqError((err as Error).message || 'Failed to submit request.');
@@ -456,11 +530,75 @@ export const MultiStorePortal: React.FC = () => {
     }
   };
 
-  // Admin: Delete Store
-  const handleDeleteStore = async (storeId: string, storeName: string) => {
-    if (window.confirm(`Are you sure you want to permanently delete the store "${storeName}" (${storeId})? This action cannot be undone.`)) {
-      await deleteMasterStore(storeId);
+  // Admin: Extend Store Trial
+  const handleAdminExtendTrial = async (storeId: string, storeName: string) => {
+    setAdminBanner(null);
+    const res = await extendStoreTrial(storeId, 7);
+    if (res.success) {
+      setAdminBanner({
+        type: 'success',
+        text: `Trial for "${storeName}" was extended by +7 days successfully!`,
+      });
       await loadAdminData();
+    } else {
+      setAdminBanner({
+        type: 'error',
+        text: res.error || 'Failed to extend trial.',
+      });
+    }
+  };
+
+  // Admin: Grant Full Lifetime License
+  const handleAdminGrantFullLicense = async (storeId: string, storeName: string) => {
+    setAdminBanner(null);
+    const res = await extendStoreTrial(storeId, 3650); // 10 years or full license
+    if (res.success) {
+      setAdminBanner({
+        type: 'success',
+        text: `Store "${storeName}" has been upgraded to a Full Lifetime License!`,
+      });
+      await loadAdminData();
+    } else {
+      setAdminBanner({
+        type: 'error',
+        text: res.error || 'Failed to upgrade store.',
+      });
+    }
+  };
+
+  // Admin: Initiate Delete Store (Opens Modal)
+  const handleInitiateDeleteStore = (store: StoreMeta) => {
+    setAdminBanner(null);
+    setStoreToDelete(store);
+  };
+
+  // Admin: Confirm Permanent Delete Store
+  const handleConfirmDeleteStore = async () => {
+    if (!storeToDelete) return;
+    setIsDeletingStore(true);
+    try {
+      const res = await deleteMasterStore(storeToDelete.id);
+      if (res.success) {
+        setAdminStores((prev) => prev.filter((s) => s.id !== storeToDelete.id));
+        setAdminBanner({
+          type: 'success',
+          text: `Store "${storeToDelete.name}" (${storeToDelete.id}) was permanently deleted.`,
+        });
+        setStoreToDelete(null);
+        await loadAdminData();
+      } else {
+        setAdminBanner({
+          type: 'error',
+          text: res.error || 'Failed to delete store from cloud.',
+        });
+      }
+    } catch (err: unknown) {
+      setAdminBanner({
+        type: 'error',
+        text: (err as Error).message || 'Error occurred while deleting store.',
+      });
+    } finally {
+      setIsDeletingStore(false);
     }
   };
 
@@ -539,35 +677,92 @@ export const MultiStorePortal: React.FC = () => {
               Every store created has its own private partition in the cloud. Store creation is protected by administrator license keys to guarantee performance and security.
             </p>
 
+            {/* 7-DAY FREE TRIAL PROMO BANNER */}
+            <div className="p-4 rounded-2xl bg-gradient-to-br from-amber-500/20 via-orange-500/10 to-slate-900 border border-amber-500/40 space-y-3 relative overflow-hidden">
+              <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/10 rounded-full blur-2xl pointer-events-none" />
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-amber-300 text-xs font-bold">
+                  <Flame className="w-4 h-4 text-orange-400 animate-pulse" />
+                  <span>Free 7-Day Full Trial</span>
+                </div>
+                <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-extrabold border border-amber-500/30">
+                  NO KEY REQUIRED
+                </span>
+              </div>
+              <p className="text-xs text-slate-200 leading-relaxed">
+                Try StoreLedger POS free for a full week. Get POS checkout, barcode scanner, debt ledger, cloud backup, and staff accounts immediately!
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('trial');
+                  setTrialError('');
+                }}
+                className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black text-xs shadow-lg shadow-amber-500/20 transition-all flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Zap className="w-4 h-4" />
+                <span>Start 7-Day Free Trial Now &rarr;</span>
+              </button>
+            </div>
+
             {/* Direct Contact Banner */}
             <div className="p-4 rounded-2xl bg-gradient-to-br from-indigo-950/50 to-slate-900/90 border border-indigo-500/30 space-y-3">
-              <div className="flex items-center gap-2 text-indigo-300 text-xs font-bold">
-                <Crown className="w-4 h-4 text-amber-400" />
-                <span>Talk to the Platform Administrator</span>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-indigo-300 text-xs font-bold">
+                  <Crown className="w-4 h-4 text-amber-400" />
+                  <span>Talk to the Platform Administrator (Khaldon)</span>
+                </div>
+                <span className="text-[10px] uppercase font-mono tracking-wider px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  Direct Support
+                </span>
               </div>
               <p className="text-xs text-slate-300">
-                Need a new store account or activation key? Contact Khaldon directly:
+                Need a new store workspace, custom setup, or activation license key? Connect directly via WhatsApp, Phone, or Email:
               </p>
-              <div className="flex flex-col sm:flex-row gap-2 pt-1">
+              
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1">
+                <a
+                  href={`https://wa.me/${masterAdminWhatsapp}?text=${encodeURIComponent(
+                    'Hi Khaldon, I would like to request an activation key and get started on StoreLedger POS.'
+                  )}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-300 hover:text-white border border-emerald-500/40 text-xs font-bold transition-all shadow-xs"
+                >
+                  <MessageCircle className="w-4 h-4 text-emerald-400" />
+                  <span>WhatsApp ({masterAdminPhone})</span>
+                </a>
+
+                <a
+                  href={`tel:${masterAdminPhone}`}
+                  className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-teal-600/20 hover:bg-teal-600/30 text-teal-300 hover:text-white border border-teal-500/30 text-xs font-bold transition-all"
+                >
+                  <Phone className="w-3.5 h-3.5 text-teal-400" />
+                  <span>Call ({masterAdminPhone})</span>
+                </a>
+
                 <a
                   href={`mailto:${masterAdminEmail}?subject=StoreLedger%20New%20Store%20Access%20Request&body=Hi%20Khaldon%2C%0A%0AI%20would%20like%20to%20request%20access%20to%20create%20a%20new%20store%20workspace%20on%20StoreLedger%20POS.%0A%0AMy%20Business%20Name%3A%20%0AMy%20Name%3A%20%0AMy%20Phone%3A%20%0A%0AThank%20you!`}
-                  className="flex-1 inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-bold transition-all"
+                  className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 hover:text-white border border-blue-500/30 text-xs font-bold transition-all"
                 >
-                  <Mail className="w-3.5 h-3.5" />
-                  <span>Email Khaldon</span>
+                  <Mail className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Email Admin</span>
                 </a>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-slate-800 text-[11px] text-slate-400">
+                <div className="flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>Admin Contact: <strong className="text-slate-200">{masterAdminEmail}</strong> | <strong className="text-emerald-300">{masterAdminPhone}</strong></span>
+                </div>
                 <button
                   type="button"
                   onClick={() => setActiveTab('request')}
-                  className="flex-1 inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-xl bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 hover:text-white border border-emerald-500/30 text-xs font-bold transition-all cursor-pointer"
+                  className="inline-flex items-center gap-1 text-indigo-300 hover:text-indigo-200 font-bold transition-colors cursor-pointer"
                 >
-                  <Send className="w-3.5 h-3.5" />
-                  <span>Submit Request</span>
+                  <span>Or fill web request form</span>
+                  <ArrowRight className="w-3 h-3" />
                 </button>
-              </div>
-              <div className="text-[11px] text-slate-400 flex items-center gap-1.5 pt-1">
-                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Direct Admin Contact: <strong className="text-slate-200">{masterAdminEmail}</strong></span>
               </div>
             </div>
 
@@ -615,59 +810,295 @@ export const MultiStorePortal: React.FC = () => {
           <div className="lg:col-span-7">
             <div className="bg-slate-900/90 backdrop-blur-xl border border-slate-800 rounded-3xl p-5 sm:p-7 shadow-2xl relative overflow-hidden">
               {/* Tab Selector */}
-              <div className="grid grid-cols-3 p-1 bg-slate-950/80 border border-slate-800 rounded-2xl mb-6 gap-1">
+              <div className="grid grid-cols-2 sm:grid-cols-4 p-1 bg-slate-950/80 border border-slate-800 rounded-2xl mb-6 gap-1">
                 <button
                   type="button"
                   onClick={() => {
                     setActiveTab('login');
                     setLoginError('');
+                    setTrialError('');
                     setActError('');
                     setReqError('');
                   }}
-                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-all ${
+                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
                     activeTab === 'login'
                       ? 'bg-blue-600 text-white shadow-md'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
                   }`}
                 >
-                  <LogIn className="w-4 h-4" />
+                  <LogIn className="w-3.5 h-3.5" />
                   <span>Sign In</span>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('trial');
+                    setLoginError('');
+                    setTrialError('');
+                    setActError('');
+                    setReqError('');
+                  }}
+                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all relative ${
+                    activeTab === 'trial'
+                      ? 'bg-gradient-to-r from-amber-500 to-orange-500 text-slate-950 font-black shadow-md'
+                      : 'text-amber-400 hover:text-amber-300 hover:bg-amber-500/10'
+                  }`}
+                >
+                  <Zap className="w-3.5 h-3.5 fill-current" />
+                  <span>7-Day Trial</span>
+                </button>
+
                 <button
                   type="button"
                   onClick={() => {
                     setActiveTab('activate');
                     setLoginError('');
+                    setTrialError('');
                     setActError('');
                     setReqError('');
                   }}
-                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-all ${
+                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
                     activeTab === 'activate'
                       ? 'bg-emerald-600 text-white shadow-md'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
                   }`}
                 >
-                  <Key className="w-4 h-4" />
-                  <span>Activate Store</span>
+                  <Key className="w-3.5 h-3.5" />
+                  <span>Activate Key</span>
                 </button>
+
                 <button
                   type="button"
                   onClick={() => {
                     setActiveTab('request');
                     setLoginError('');
+                    setTrialError('');
                     setActError('');
                     setReqError('');
                   }}
-                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs sm:text-sm font-bold transition-all ${
+                  className={`flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-bold transition-all ${
                     activeTab === 'request'
                       ? 'bg-indigo-600 text-white shadow-md'
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
                   }`}
                 >
-                  <MessageSquare className="w-4 h-4" />
-                  <span>Request Access</span>
+                  <MessageSquare className="w-3.5 h-3.5" />
+                  <span>Request</span>
                 </button>
               </div>
+
+              {/* ================= TAB: 7-DAY FREE TRIAL ================= */}
+              {activeTab === 'trial' && (
+                <form onSubmit={handleStartFreeTrial} className="space-y-4 text-left">
+                  <div className="p-4 rounded-2xl bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-amber-500/5 border border-amber-500/30 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="w-8 h-8 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center font-black">
+                          <Zap className="w-4 h-4 fill-slate-950" />
+                        </span>
+                        <div>
+                          <h3 className="text-sm font-black text-white">
+                            Start 7-Day Free Trial
+                          </h3>
+                          <p className="text-[11px] text-amber-300">
+                            No credit card and no license key required — test all POS features instantly.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5 text-[11px] text-slate-300 pt-1 border-t border-amber-500/20">
+                      <div className="flex items-center gap-1 text-emerald-400">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Full POS Checkout & Barcode Scanner</span>
+                      </div>
+                      <div className="flex items-center gap-1 text-emerald-400">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Cloud Multi-Device Sync</span>
+                      </div>
+                      <div className="flex items-center gap-1 text-emerald-400">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>Customer Debts & Profit Reports</span>
+                      </div>
+                      <div className="flex items-center gap-1 text-emerald-400">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        <span>7 Days Complete Access</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {trialError && (
+                    <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                      <div>{trialError}</div>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {/* Store Name */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Store / Business Name *
+                      </label>
+                      <div className="relative">
+                        <Building2 className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          required
+                          value={trialStoreName}
+                          onChange={(e) => setTrialStoreName(e.target.value)}
+                          placeholder="e.g. Hope Supermarket"
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Owner Name */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Owner / Manager Name *
+                      </label>
+                      <div className="relative">
+                        <UserIcon className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          required
+                          value={trialOwnerName}
+                          onChange={(e) => setTrialOwnerName(e.target.value)}
+                          placeholder="e.g. Khaldon"
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {/* Owner Email */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Login Email Address *
+                      </label>
+                      <div className="relative">
+                        <Mail className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="email"
+                          required
+                          value={trialOwnerEmail}
+                          onChange={(e) => setTrialOwnerEmail(e.target.value)}
+                          placeholder="owner@mybusiness.com"
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Currency */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Store Currency
+                      </label>
+                      <div className="relative">
+                        <Coins className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <select
+                          value={trialCurrency}
+                          onChange={(e) => setTrialCurrency(e.target.value)}
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        >
+                          {POPULAR_CURRENCIES.map((c) => (
+                            <option key={c.code} value={c.code}>
+                              {c.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    {/* Password */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Password *
+                      </label>
+                      <div className="relative">
+                        <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type={showTrialPassword ? 'text' : 'password'}
+                          required
+                          value={trialPassword}
+                          onChange={(e) => setTrialPassword(e.target.value)}
+                          placeholder="At least 4 chars"
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-8 py-2 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowTrialPassword(!showTrialPassword)}
+                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                        >
+                          {showTrialPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Confirm Password */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Confirm Password *
+                      </label>
+                      <div className="relative">
+                        <Lock className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type={showTrialPassword ? 'text' : 'password'}
+                          required
+                          value={trialConfirmPassword}
+                          onChange={(e) => setTrialConfirmPassword(e.target.value)}
+                          placeholder="Repeat password"
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Quick PIN */}
+                    <div className="space-y-1">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Quick Cashier PIN
+                      </label>
+                      <div className="relative">
+                        <KeyRound className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          maxLength={6}
+                          value={trialPin}
+                          onChange={(e) => setTrialPin(e.target.value)}
+                          placeholder="e.g. 1234"
+                          className="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-white placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isStartingTrial}
+                    className="w-full mt-2 bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black py-3.5 rounded-xl shadow-lg shadow-amber-500/20 transition-all flex items-center justify-center gap-2 disabled:opacity-60 cursor-pointer text-sm"
+                  >
+                    {isStartingTrial ? (
+                      <span className="flex items-center gap-2">
+                        <span className="w-4 h-4 border-2 border-slate-950 border-t-transparent rounded-full animate-spin" />
+                        Setting up your store & launching free trial...
+                      </span>
+                    ) : (
+                      <>
+                        <Zap className="w-4 h-4 fill-slate-950" />
+                        <span>🚀 Start 7-Day Free Trial Now</span>
+                      </>
+                    )}
+                  </button>
+
+                  <div className="text-center text-[11px] text-slate-400">
+                    You can upgrade to a permanent full license at any time without losing any sales or product data.
+                  </div>
+                </form>
+              )}
 
               {/* ================= TAB 1: SIGN IN ================= */}
               {activeTab === 'login' && (
@@ -1013,8 +1444,30 @@ export const MultiStorePortal: React.FC = () => {
                       </div>
                       <h4 className="text-base font-bold text-white">Application Submitted Successfully!</h4>
                       <p className="text-xs text-slate-300 max-w-md mx-auto">
-                        Your request has been delivered to administrator Khaldon (<strong className="text-emerald-300">{masterAdminEmail}</strong>). You will be contacted with your private store activation key.
+                        Your request has been delivered to administrator Khaldon (<strong className="text-emerald-300">{masterAdminEmail}</strong> / <strong className="text-emerald-300">{masterAdminPhone}</strong>). You will be contacted with your private store activation key.
                       </p>
+                      
+                      <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                        <a
+                          href={`https://wa.me/${masterAdminWhatsapp}?text=${encodeURIComponent(
+                            `Hi Khaldon, I just submitted an application for a new store workspace on StoreLedger POS (Request ID: ${reqSubmitted}).`
+                          )}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/30 hover:bg-emerald-600/40 border border-emerald-500/40 text-emerald-300 text-xs font-bold transition-all"
+                        >
+                          <MessageCircle className="w-3.5 h-3.5" />
+                          <span>Message on WhatsApp ({masterAdminPhone})</span>
+                        </a>
+                        <a
+                          href={`tel:${masterAdminPhone}`}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-600/20 hover:bg-teal-600/30 border border-teal-500/30 text-teal-300 text-xs font-bold transition-all"
+                        >
+                          <Phone className="w-3.5 h-3.5" />
+                          <span>Call: {masterAdminPhone}</span>
+                        </a>
+                      </div>
+
                       <div className="p-3 bg-slate-950/80 rounded-xl text-xs font-mono text-slate-400 inline-block border border-slate-800">
                         Request ID: <strong className="text-white">{reqSubmitted}</strong>
                       </div>
@@ -1705,41 +2158,102 @@ export const MultiStorePortal: React.FC = () => {
 
                       {/* SUB-TAB 4: ALL REGISTERED STORES */}
                       {adminSubTab === 'stores' && (
-                        <div className="space-y-2">
+                        <div className="space-y-3">
+                          {adminBanner && (
+                            <div
+                              className={`p-3.5 rounded-xl border text-xs flex items-center justify-between gap-2 animate-in fade-in ${
+                                adminBanner.type === 'success'
+                                  ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                                  : 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2">
+                                {adminBanner.type === 'success' ? (
+                                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                                ) : (
+                                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                                )}
+                                <span>{adminBanner.text}</span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => setAdminBanner(null)}
+                                className="text-slate-400 hover:text-white text-xs font-bold px-1.5 py-0.5 rounded cursor-pointer"
+                              >
+                                &times;
+                              </button>
+                            </div>
+                          )}
+
                           {adminStores.length === 0 ? (
                             <div className="p-8 text-center text-xs text-slate-500 bg-slate-950/40 rounded-2xl border border-slate-800">
                               No stores currently registered on the platform.
                             </div>
                           ) : (
-                            adminStores.map((s) => (
-                              <div
-                                key={s.id}
-                                className="flex items-center justify-between p-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-xs"
-                              >
-                                <div className="space-y-0.5">
-                                  <div className="font-bold text-white text-sm flex items-center gap-2">
-                                    <span>{s.name}</span>
-                                    <span className="text-[10px] font-mono text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-slate-800">
-                                      {s.currency}
-                                    </span>
-                                  </div>
-                                  <div className="text-slate-400 text-[11px]">
-                                    Owner: <strong className="text-slate-200">{s.ownerEmail}</strong> ({s.ownerName})
-                                  </div>
-                                </div>
+                            adminStores.map((s) => {
+                              const isTrial = s.isTrial || s.planType === 'trial';
+                              const trialEnd = s.trialEndsAt || 0;
+                              const isExpired = isTrial && trialEnd > 0 && Date.now() > trialEnd;
+                              const daysLeft = isTrial && trialEnd > 0 ? Math.max(0, Math.ceil((trialEnd - Date.now()) / (1000 * 60 * 60 * 24))) : 0;
 
-                                <div className="flex items-center gap-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleDeleteStore(s.id, s.name)}
-                                    className="p-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/80 text-rose-400 hover:text-rose-200 border border-rose-800/40 transition-colors"
-                                    title="Delete store permanently"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+                              return (
+                                <div
+                                  key={s.id}
+                                  className="flex flex-col sm:flex-row sm:items-center justify-between p-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-xs gap-3"
+                                >
+                                  <div className="space-y-1">
+                                    <div className="font-bold text-white text-sm flex items-center gap-2 flex-wrap">
+                                      <span>{s.name}</span>
+                                      <span className="text-[10px] font-mono text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-slate-800">
+                                        {s.currency}
+                                      </span>
+                                      {isTrial ? (
+                                        isExpired ? (
+                                          <span className="px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 text-[10px] font-bold border border-rose-500/30">
+                                            Trial Expired
+                                          </span>
+                                        ) : (
+                                          <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] font-bold border border-amber-500/30">
+                                            ⚡ Trial ({daysLeft} days left)
+                                          </span>
+                                        )
+                                      ) : (
+                                        <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/30 flex items-center gap-1">
+                                          <Crown className="w-3 h-3 text-amber-400" />
+                                          Full License
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="text-slate-400 text-[11px]">
+                                      Owner: <strong className="text-slate-200">{s.ownerEmail}</strong> ({s.ownerName})
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                                    {isTrial && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleAdminExtendTrial(s.id, s.name)}
+                                        className="px-2.5 py-1.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[11px] font-semibold transition-colors flex items-center gap-1 cursor-pointer"
+                                        title="Add 7 days to free trial"
+                                      >
+                                        <Clock className="w-3 h-3" />
+                                        <span>+7d Trial</span>
+                                      </button>
+                                    )}
+
+                                    <button
+                                      type="button"
+                                      onClick={() => handleInitiateDeleteStore(s)}
+                                      className="p-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/80 text-rose-400 hover:text-rose-200 border border-rose-800/40 transition-colors cursor-pointer"
+                                      title="Delete store permanently"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
                                 </div>
-                              </div>
-                            ))
+                              );
+                            })
                           )}
                         </div>
                       )}
@@ -1751,6 +2265,72 @@ export const MultiStorePortal: React.FC = () => {
           </div>
         </div>
       </main>
+
+      {/* Permanently Delete Store In-App Modal */}
+      {storeToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
+          <div className="bg-slate-900 border border-rose-500/40 rounded-3xl p-6 max-w-md w-full shadow-2xl shadow-rose-950/50 space-y-4 text-left">
+            <div className="flex items-center gap-3">
+              <div className="w-11 h-11 rounded-2xl bg-rose-500/20 text-rose-400 flex items-center justify-center shrink-0 border border-rose-500/30">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white">Permanently Delete Store</h3>
+                <p className="text-xs text-rose-300/80">Irreversible Cloud Action</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-rose-950/30 border border-rose-800/40 text-xs text-rose-200 space-y-2">
+              <p className="font-semibold text-rose-300">
+                Are you sure you want to permanently delete this store?
+              </p>
+              <div className="bg-slate-950/80 p-2.5 rounded-xl border border-slate-800 space-y-1 font-mono text-[11px] text-slate-300">
+                <div>
+                  <span className="text-slate-500">Store Name:</span> <strong className="text-white">{storeToDelete.name}</strong>
+                </div>
+                <div>
+                  <span className="text-slate-500">Store ID:</span> {storeToDelete.id}
+                </div>
+                <div>
+                  <span className="text-slate-500">Owner Email:</span> {storeToDelete.ownerEmail}
+                </div>
+              </div>
+              <p className="text-[11px] text-rose-300/70 leading-relaxed">
+                All inventory items, sales records, customers, suppliers, staff users, and cloud database documents for this store will be permanently wiped.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                type="button"
+                disabled={isDeletingStore}
+                onClick={() => setStoreToDelete(null)}
+                className="flex-1 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition-all cursor-pointer disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingStore}
+                onClick={handleConfirmDeleteStore}
+                className="flex-1 py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold shadow-lg shadow-rose-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                {isDeletingStore ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    <span>Deleting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-4 h-4" />
+                    <span>Delete Permanently</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="relative z-10 w-full max-w-7xl mx-auto px-6 py-4 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 border-t border-slate-800/60 gap-2">

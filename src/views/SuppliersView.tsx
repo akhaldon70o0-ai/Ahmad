@@ -13,6 +13,7 @@ export const SuppliersView: React.FC = () => {
   const [editingSupplier, setEditingSupplier] = useState<SupplierRecord | null>(null);
   const [selectedLedgerId, setSelectedLedgerId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
+  const [supplierToDelete, setSupplierToDelete] = useState<SupplierRecord | null>(null);
 
   const resetForm = () => {
     setName('');
@@ -191,12 +192,10 @@ export const SuppliersView: React.FC = () => {
                           <Edit className="w-3.5 h-3.5" />
                         </button>
                         <button
-                          onClick={() => {
-                            if (window.confirm(`Delete supplier "${s.name}"?`)) {
-                              deleteSupplier(s.id);
-                            }
-                          }}
-                          className="p-1 text-rose-600 hover:bg-rose-50 rounded-lg"
+                          type="button"
+                          onClick={() => setSupplierToDelete(s)}
+                          className="p-1 text-rose-600 hover:bg-rose-50 rounded-lg cursor-pointer transition-colors"
+                          title="Delete Supplier"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -209,6 +208,54 @@ export const SuppliersView: React.FC = () => {
           </table>
         )}
       </div>
+
+      {/* In-App Delete Supplier Confirmation Modal */}
+      {supplierToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4 text-left">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Delete Supplier</h3>
+                <p className="text-xs text-slate-500 font-mono">#{supplierToDelete.id}</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-rose-50/70 rounded-xl border border-rose-200/80 text-xs text-rose-900 space-y-2">
+              <p className="font-semibold text-rose-800">
+                Are you sure you want to delete supplier <b className="text-rose-950 font-bold">"{supplierToDelete.name}"</b>?
+              </p>
+              <div className="bg-white p-2.5 rounded-lg border border-rose-200 space-y-1 font-mono text-[11px] text-slate-700">
+                <div>Phone: {supplierToDelete.mobile || '—'}</div>
+                <div>Address: {supplierToDelete.address || '—'}</div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setSupplierToDelete(null)}
+                className="flex-1 py-2.5 px-4 rounded-xl border border-slate-200 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-all cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  deleteSupplier(supplierToDelete.id);
+                  setSupplierToDelete(null);
+                }}
+                className="flex-1 py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Delete Supplier
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Selected Supplier Ledger Modal / Panel */}
       {selectedSupplier && (

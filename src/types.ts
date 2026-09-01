@@ -14,6 +14,9 @@ export interface StoreMeta {
   description?: string;
   activationCode?: string;
   isApproved?: boolean;
+  isTrial?: boolean;
+  trialEndsAt?: string;
+  planType?: 'trial' | 'full' | 'lifetime';
 }
 
 export interface StoreAccessRequest {

@@ -57,9 +57,14 @@ import {
   fetchActivationCodes,
   fetchAllStoresForMasterAdmin,
   deleteStoreInCloud,
+  upgradeStoreLicenseInCloud,
+  extendStoreTrialInCloud,
   sendOwnerVerificationCode,
   verifyOwnerVerificationCode,
   MASTER_ADMIN_EMAIL,
+  MASTER_ADMIN_PHONE,
+  MASTER_ADMIN_PHONE_INTL,
+  MASTER_ADMIN_WHATSAPP,
   MASTER_PASSCODES,
   CloudSyncState,
   CloudStoreData,
@@ -80,6 +85,7 @@ interface StoreContextType {
     currency?: string;
     description?: string;
     activationCode?: string;
+    isTrial?: boolean;
   }) => Promise<{ success: boolean; error?: string; store?: StoreMeta }>;
   loginToStore: (
     identifier: string,
@@ -90,9 +96,16 @@ interface StoreContextType {
   logoutStore: () => void;
   listStoresForEmail: (email: string) => Promise<StoreMeta[]>;
   updateCurrentStoreMeta: (updates: Partial<StoreMeta>) => Promise<boolean>;
+  upgradeStoreLicense: (code: string) => Promise<{ success: boolean; error?: string }>;
+  extendStoreTrial: (storeId: string, days?: number) => Promise<{ success: boolean; newExpiry?: string; error?: string }>;
+  isTrialExpired: boolean;
+  trialDaysRemaining: number;
 
   // Store Requests & License Codes (Access Control)
   masterAdminEmail: string;
+  masterAdminPhone: string;
+  masterAdminPhoneIntl: string;
+  masterAdminWhatsapp: string;
   isMasterAdmin: (email?: string) => boolean;
   submitAccessRequest: (req: Omit<StoreAccessRequest, 'id' | 'status' | 'requestedAt'>) => Promise<{ success: boolean; id: string; error?: string }>;
   getAccessRequests: () => Promise<StoreAccessRequest[]>;
@@ -100,7 +113,7 @@ interface StoreContextType {
   generateActivationCode: (code: string, email?: string, business?: string, notes?: string) => Promise<{ success: boolean; item?: ActivationCode; error?: string }>;
   getActivationCodes: () => Promise<ActivationCode[]>;
   getAllMasterStores: () => Promise<StoreMeta[]>;
-  deleteMasterStore: (storeId: string) => Promise<boolean>;
+  deleteMasterStore: (storeId: string) => Promise<{ success: boolean; error?: string }>;
   requestOwnerOtp: (email: string) => Promise<{ success: boolean; expiresAt?: string; error?: string }>;
   verifyOwnerOtp: (email: string, code: string) => Promise<{ valid: boolean; reason?: string }>;
 
@@ -727,6 +740,63 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     return verifyOwnerVerificationCode(email, code);
   }, []);
 
+  const upgradeStoreLicense = useCallback(
+    async (code: string) => {
+      if (!currentStore) return { success: false, error: 'No active store selected.' };
+      const res = await upgradeStoreLicenseInCloud(currentStore.id, currentStore.ownerEmail, code);
+      if (res.success) {
+        const updatedMeta: StoreMeta = {
+          ...currentStore,
+          isTrial: false,
+          planType: 'full',
+          activationCode: code.trim().toUpperCase(),
+          trialEndsAt: undefined,
+        };
+        setCurrentStore(updatedMeta);
+        try {
+          localStorage.setItem('active_store_meta', JSON.stringify(updatedMeta));
+        } catch {
+          // ignore
+        }
+      }
+      return res;
+    },
+    [currentStore]
+  );
+
+  const extendStoreTrial = useCallback(
+    async (storeId: string, days: number = 7) => {
+      const res = await extendStoreTrialInCloud(storeId, days);
+      if (res.success && currentStore && currentStore.id === storeId && res.newExpiry) {
+        const updatedMeta: StoreMeta = {
+          ...currentStore,
+          isTrial: true,
+          planType: 'trial',
+          trialEndsAt: res.newExpiry,
+        };
+        setCurrentStore(updatedMeta);
+        try {
+          localStorage.setItem('active_store_meta', JSON.stringify(updatedMeta));
+        } catch {
+          // ignore
+        }
+      }
+      return res;
+    },
+    [currentStore]
+  );
+
+  // Compute trial status
+  const isTrial = Boolean(currentStore?.isTrial);
+  const trialEndsAt = currentStore?.trialEndsAt;
+  const isTrialExpired = Boolean(
+    isTrial && trialEndsAt && new Date(trialEndsAt).getTime() < Date.now()
+  );
+  const trialDaysRemaining =
+    isTrial && trialEndsAt
+      ? Math.max(0, Math.ceil((new Date(trialEndsAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
+      : 0;
+
   /**
    * Create a new Store in Cloud Firestore
    */
@@ -739,22 +809,22 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     currency?: string;
     description?: string;
     activationCode?: string;
+    isTrial?: boolean;
   }): Promise<{ success: boolean; error?: string; store?: StoreMeta }> => {
     setIsStoreLoading(true);
     try {
       const cleanEmail = params.ownerEmail.trim().toLowerCase();
       const safeStoreId = `store_${cleanEmail.replace(/[^a-z0-9]/g, '_')}_${Date.now().toString(36)}`;
-
-      // 🛑 ACCESS CONTROL CHECK: Verify activation license code
       const isOwnerCreating = cleanEmail === MASTER_ADMIN_EMAIL.toLowerCase();
-      if (!isOwnerCreating) {
+      const isStartingTrial = Boolean(params.isTrial && !isOwnerCreating);
+
+      // 🛑 ACCESS CONTROL CHECK: Verify activation license code if not in Trial or Master Admin
+      if (!isOwnerCreating && !isStartingTrial) {
         if (!params.activationCode || !params.activationCode.trim()) {
           return {
             success: false,
             error:
-              'Store creation is protected. Please provide a valid Activation License Key, or contact the administrator at ' +
-              MASTER_ADMIN_EMAIL +
-              ' to request an account.',
+              'Store creation is protected. Please provide a valid Activation License Key, or choose the 7-Day Free Trial option.',
           };
         }
 
@@ -781,6 +851,11 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         passwordSalt = hashed.salt;
       }
 
+      // Calculate 7-day trial expiration if starting free trial
+      const trialExpiresAt = isStartingTrial
+        ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
+        : undefined;
+
       const storeMeta: StoreMeta = {
         id: safeStoreId,
         name: params.storeName.trim(),
@@ -793,8 +868,13 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         passwordHash,
         passwordSalt,
         description: params.description?.trim(),
-        activationCode: params.activationCode?.trim().toUpperCase(),
+        activationCode: isStartingTrial
+          ? 'FREE-TRIAL-7DAYS'
+          : params.activationCode?.trim().toUpperCase(),
         isApproved: true,
+        isTrial: isStartingTrial,
+        trialEndsAt: trialExpiresAt,
+        planType: isStartingTrial ? 'trial' : 'full',
       };
 
       const adminUser: User = {
@@ -1460,8 +1540,57 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const deleteSale = (id: string) => {
+    const targetSale = sales.find((s) => s.id === id);
+    if (targetSale) {
+      // 1. Restore stock of all sold items & log stock movements
+      if (targetSale.items && targetSale.items.length > 0) {
+        targetSale.items.forEach((saleItem) => {
+          if (saleItem.itemId) {
+            setInventory((prev) =>
+              prev.map((inv) => {
+                if (inv.id === saleItem.itemId || inv.name.toLowerCase() === saleItem.itemName.toLowerCase()) {
+                  const nextQty = inv.qty + saleItem.qty;
+                  const movement: StockMovement = {
+                    id: generateId('mov'),
+                    date: getTodayDateString(),
+                    type: 'IN',
+                    itemId: inv.id,
+                    itemName: inv.name,
+                    qty: saleItem.qty,
+                    qtyChange: saleItem.qty,
+                    previousQty: inv.qty,
+                    newQty: nextQty,
+                    reference: `Voided Sale #${targetSale.id}`,
+                    userId: currentUser.id,
+                    userName: currentUser.name,
+                  };
+                  setStockMovements((m) => [movement, ...m]);
+                  return { ...inv, qty: nextQty };
+                }
+                return inv;
+              })
+            );
+          }
+        });
+      }
+
+      // 2. If the sale had debt, reduce customer's debt
+      if (targetSale.customer && (targetSale.debt || targetSale.paymentMethod === 'debt' || targetSale.paymentMethod === 'credit')) {
+        const debtAmt = targetSale.debt || targetSale.total;
+        if (debtAmt > 0) {
+          setCustomers((prev) =>
+            prev.map((c) =>
+              c.name === targetSale.customer || c.id === targetSale.customer
+                ? { ...c, totalDebt: Math.max(0, (c.totalDebt || 0) - debtAmt) }
+                : c
+            )
+          );
+        }
+      }
+    }
+
     setSales((prev) => prev.filter((s) => s.id !== id));
-    logActivity('sale_delete', 'Sale Voided', `Voided sale ticket.`);
+    logActivity('sale_delete', 'Sale Voided', `Voided sale ticket #${id}.`);
     playSound('delete', settings.soundEnabled);
   };
 
@@ -1967,9 +2096,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     logoutStore,
     listStoresForEmail,
     updateCurrentStoreMeta,
+    upgradeStoreLicense,
+    extendStoreTrial,
+    isTrialExpired,
+    trialDaysRemaining,
 
     // Store Requests & License Codes (Access Control)
     masterAdminEmail: MASTER_ADMIN_EMAIL,
+    masterAdminPhone: MASTER_ADMIN_PHONE,
+    masterAdminPhoneIntl: MASTER_ADMIN_PHONE_INTL,
+    masterAdminWhatsapp: MASTER_ADMIN_WHATSAPP,
     isMasterAdmin,
     submitAccessRequest,
     getAccessRequests,

@@ -49,7 +49,8 @@ export const BackupRestoreView: React.FC = () => {
       lowStockAlert,
       cloudWebhookUrl: cloudWebhookUrl.trim(),
     });
-    alert('Settings saved successfully!');
+    setFeedbackMsg({ type: 'success', text: 'Store settings saved successfully!' });
+    setTimeout(() => setFeedbackMsg(null), 4000);
   };
 
   const handleDownloadBackup = () => {
@@ -63,6 +64,8 @@ export const BackupRestoreView: React.FC = () => {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+    setFeedbackMsg({ type: 'success', text: 'Backup JSON downloaded successfully.' });
+    setTimeout(() => setFeedbackMsg(null), 4000);
   };
 
   const handleFileImport = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -75,13 +78,14 @@ export const BackupRestoreView: React.FC = () => {
         const jsonStr = event.target?.result as string;
         const res = importAllDataFromJson(jsonStr);
         if (res.success) {
-          alert('Data restored successfully!');
+          setFeedbackMsg({ type: 'success', text: 'Store data restored successfully from backup file!' });
         } else {
-          alert(`Import failed: ${res.error}`);
+          setFeedbackMsg({ type: 'error', text: `Import failed: ${res.error}` });
         }
       } catch (err: any) {
-        alert(`Failed to parse file: ${err.message}`);
+        setFeedbackMsg({ type: 'error', text: `Failed to parse backup JSON: ${err.message}` });
       }
+      setTimeout(() => setFeedbackMsg(null), 5000);
     };
     reader.readAsText(file);
   };
@@ -89,15 +93,35 @@ export const BackupRestoreView: React.FC = () => {
   const handleChangePin = (e: React.FormEvent) => {
     e.preventDefault();
     if (newPin.length !== 4 || !/^\d+$/.test(newPin)) {
-      return alert('PIN must be exactly 4 digits.');
+      setFeedbackMsg({ type: 'error', text: 'PIN must be exactly 4 digits.' });
+      return;
     }
     setPin(newPin);
-    alert('Manager PIN updated successfully!');
+    setFeedbackMsg({ type: 'success', text: 'Manager PIN updated successfully!' });
     setNewPinState('');
+    setTimeout(() => setFeedbackMsg(null), 4000);
   };
 
   return (
     <div className="space-y-6 animate-in fade-in duration-200">
+      {feedbackMsg && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs font-semibold flex items-center justify-between shadow-xs animate-in fade-in ${
+            feedbackMsg.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-rose-50 border-rose-200 text-rose-800'
+          }`}
+        >
+          <span>{feedbackMsg.text}</span>
+          <button
+            type="button"
+            onClick={() => setFeedbackMsg(null)}
+            className="font-bold ml-2 cursor-pointer hover:opacity-75"
+          >
+            &times;
+          </button>
+        </div>
+      )}
       {/* General Store Settings */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-xs p-5">
         <h2 className="text-base font-extrabold text-slate-900 flex items-center gap-2 mb-4">

@@ -10,7 +10,6 @@ import { Navbar } from './components/Navbar';
 import { Sidebar } from './components/Sidebar';
 import { AuthModal } from './components/AuthModal';
 import { BarcodeScannerModal } from './components/BarcodeScannerModal';
-import { MasterLockScreen, isMasterUnlocked, lockMasterApp } from './components/MasterLockScreen';
 import { MultiStorePortal } from './components/MultiStorePortal';
 
 import { DashboardView } from './views/DashboardView';
@@ -34,10 +33,11 @@ import { ExpensesView } from './views/ExpensesView';
 import { ReportsView } from './views/ReportsView';
 import { BackupRestoreView } from './views/BackupRestoreView';
 import { MigrationView } from './views/MigrationView';
+import { TrialStatusBanner } from './components/TrialStatusBanner';
+import { TrialUpgradeModal } from './components/TrialUpgradeModal';
 
 function MainApp() {
   const { currentStore, inventory, addInventoryItem, logoutStore } = useStore();
-  const [isUnlocked, setIsUnlocked] = useState<boolean>(isMasterUnlocked());
   const [currentView, setCurrentView] = useState<AppView>('dashboard');
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isScannerOpen, setIsScannerOpen] = useState(false);
@@ -49,46 +49,19 @@ function MainApp() {
     return <MultiStorePortal />;
   }
 
-  // If locked, render the master lock screen
-  if (!isUnlocked) {
-    return <MasterLockScreen onUnlock={() => setIsUnlocked(true)} />;
-  }
-
   const handleScanBarcode = (barcode: string) => {
     // Check if barcode belongs to item
     const found = inventory.find((i) => i.barcode === barcode);
     if (found) {
-      alert(`Barcode recognized: ${found.name} (Stock: ${found.qty})`);
       setCurrentView('pos');
     } else {
-      const createNew = window.confirm(`Scanned Barcode "${barcode}" is not registered. Add as a new product?`);
-      if (createNew) {
-        const prodName = window.prompt('Enter Product Name for barcode ' + barcode);
-        if (prodName && prodName.trim()) {
-          const price = parseFloat(window.prompt('Enter Selling Price:', '10.00') || '10');
-          const cost = parseFloat(window.prompt('Enter Cost Price:', '6.00') || '6');
-          addInventoryItem({
-            name: prodName.trim(),
-            barcode: barcode.trim(),
-            qty: 1,
-            cost: isNaN(cost) ? 0 : cost,
-            price: isNaN(price) ? 0 : price,
-            threshold: 5,
-          });
-          setCurrentView('inventory');
-        }
-      }
+      setCurrentView('inventory');
     }
   };
 
   const navigateToBundlesWithItem = (itemName?: string) => {
     setBundleInitialItem(itemName);
     setCurrentView('bundles');
-  };
-
-  const handleLockApp = () => {
-    lockMasterApp();
-    setIsUnlocked(false);
   };
 
   return (
@@ -107,6 +80,9 @@ function MainApp() {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* Trial Status Banner if store is in trial */}
+        <TrialStatusBanner />
+
         {/* Top Application Navbar */}
         <Navbar
           currentView={currentView}
@@ -114,7 +90,6 @@ function MainApp() {
           onOpenScanner={() => setIsScannerOpen(true)}
           onToggleMobileMenu={() => setMobileMenuOpen(!mobileMenuOpen)}
           onSelectView={(v) => setCurrentView(v as AppView)}
-          onLockApp={handleLockApp}
         />
 
         <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">

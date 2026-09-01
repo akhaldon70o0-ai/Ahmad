@@ -28,7 +28,6 @@ interface NavbarProps {
   onOpenScanner: () => void;
   onToggleMobileMenu: () => void;
   onSelectView?: (view: string) => void;
-  onLockApp?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -37,7 +36,6 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenScanner,
   onToggleMobileMenu,
   onSelectView,
-  onLockApp,
 }) => {
   const {
     currentStore,
@@ -177,18 +175,6 @@ export const Navbar: React.FC<NavbarProps> = ({
             <VolumeX className="w-4 h-4 text-slate-400" />
           )}
         </button>
-
-        {/* Master App Lock Button */}
-        {onLockApp && (
-          <button
-            onClick={onLockApp}
-            className="p-2 rounded-lg border border-slate-200 bg-white hover:bg-rose-50 text-slate-600 hover:text-rose-600 shadow-xs transition-colors flex items-center gap-1.5"
-            title="Lock App (Requires Master Password AK7.0O0)"
-          >
-            <Lock className="w-4 h-4 text-rose-500" />
-            <span className="text-xs font-bold hidden xl:inline text-slate-700">Lock App</span>
-          </button>
-        )}
 
         {/* Real-time Multi-Device Cloud Sync Indicator */}
         <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 bg-white shadow-xs">
@@ -332,18 +318,6 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <Store className="w-4 h-4 text-indigo-600" />
                   Switch / Change Store
                 </button>
-                {onLockApp && (
-                  <button
-                    onClick={() => {
-                      setShowUserDropdown(false);
-                      onLockApp();
-                    }}
-                    className="w-full px-3.5 py-2 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50 flex items-center gap-2 transition-colors"
-                  >
-                    <Lock className="w-4 h-4 text-rose-500" />
-                    Lock Master App
-                  </button>
-                )}
                 <button
                   onClick={() => {
                     setShowUserDropdown(false);

@@ -75,6 +75,9 @@ export const db = firestoreInstance;
 
 // Master Admin Configuration
 export const MASTER_ADMIN_EMAIL = 'akhaldon7.0o0@gmail.com';
+export const MASTER_ADMIN_PHONE = '0780413568';
+export const MASTER_ADMIN_PHONE_INTL = '+962780413568';
+export const MASTER_ADMIN_WHATSAPP = '962780413568';
 export const MASTER_PASSCODES = ['KHALDON-ADMIN-2026', 'KHALDON2026', 'ADMIN-2026', 'OWNER-PASS'];
 
 // Firestore Collection Names
@@ -701,15 +704,140 @@ export async function fetchAllStoresForMasterAdmin(): Promise<StoreMeta[]> {
 /**
  * Delete a store completely (Master Admin Only)
  */
-export async function deleteStoreInCloud(storeId: string): Promise<boolean> {
+export async function deleteStoreInCloud(storeId: string): Promise<{ success: boolean; error?: string }> {
   try {
     ensureFirebaseAuth();
-    await deleteDoc(doc(db, STORES_COLLECTION, storeId));
-    await deleteDoc(doc(db, STORE_DATA_COLLECTION, storeId));
+    const cleanId = (storeId || '').trim();
+    if (!cleanId) {
+      return { success: false, error: 'Invalid store ID provided.' };
+    }
+    
+    // 1. Delete main store metadata document
+    try {
+      await deleteDoc(doc(db, STORES_COLLECTION, cleanId));
+    } catch (storeMetaErr) {
+      console.warn('[Firebase] Warning deleting store metadata doc:', storeMetaErr);
+    }
+    
+    // 2. Delete full store partition document
+    try {
+      await deleteDoc(doc(db, STORE_DATA_COLLECTION, cleanId));
+    } catch (storeDataErr) {
+      console.warn('[Firebase] Warning deleting store partition doc:', storeDataErr);
+    }
+
+    // 3. Clean up user login index records pointing to this store
+    try {
+      const userIndexQuery = query(collection(db, STORE_USERS_COLLECTION), where('storeId', '==', cleanId));
+      const userIndexSnap = await getDocs(userIndexQuery);
+      const deletePromises = userIndexSnap.docs.map((d) => deleteDoc(d.ref));
+      await Promise.all(deletePromises);
+    } catch (indexErr) {
+      console.warn('[Firebase] Warning deleting user index records for store:', indexErr);
+    }
+
+    // 4. Clean up local browser caches for this store if any
+    try {
+      localStorage.removeItem(`store_${cleanId}_users`);
+      localStorage.removeItem(`store_${cleanId}_settings`);
+      localStorage.removeItem(`store_${cleanId}_offline_cache`);
+      localStorage.removeItem(`store_${cleanId}_data`);
+      const activeMetaRaw = localStorage.getItem('active_store_meta');
+      if (activeMetaRaw) {
+        const activeMeta = JSON.parse(activeMetaRaw);
+        if (activeMeta?.id === cleanId) {
+          localStorage.removeItem('active_store_meta');
+          localStorage.removeItem('active_store_id');
+        }
+      }
+    } catch {
+      // ignore local cleanup errors
+    }
+
+    return { success: true };
+  } catch (err: unknown) {
+    console.error('[Firebase] Error deleting store:', err);
+    return { success: false, error: (err as Error).message || 'Failed to delete store from cloud.' };
+  }
+}
+
+/**
+ * Update store metadata in cloud
+ */
+export async function updateStoreMetaInCloud(storeId: string, updates: Partial<StoreMeta>): Promise<boolean> {
+  try {
+    ensureFirebaseAuth();
+    const storeDocRef = doc(db, STORES_COLLECTION, storeId);
+    await setDoc(storeDocRef, sanitizePayload(updates), { merge: true });
     return true;
   } catch (err) {
-    console.error('[Firebase] Error deleting store:', err);
+    console.error('[Firebase] Error updating store metadata:', err);
     return false;
+  }
+}
+
+/**
+ * Upgrade a trial or standard store to a full licensed store
+ */
+export async function upgradeStoreLicenseInCloud(
+  storeId: string,
+  ownerEmail: string,
+  rawCode: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const codeCheck = await verifyAndConsumeActivationCode(rawCode, storeId, ownerEmail);
+    if (!codeCheck.valid) {
+      return { success: false, error: codeCheck.reason || 'Invalid license code.' };
+    }
+
+    const updates: Partial<StoreMeta> = {
+      isTrial: false,
+      planType: 'full',
+      activationCode: rawCode.trim().toUpperCase(),
+      trialEndsAt: undefined,
+      lastActive: new Date().toISOString(),
+    };
+
+    await updateStoreMetaInCloud(storeId, updates);
+    return { success: true };
+  } catch (err: unknown) {
+    return { success: false, error: (err as Error).message || 'Failed to upgrade store license.' };
+  }
+}
+
+/**
+ * Extend a store's trial duration (Admin tool)
+ */
+export async function extendStoreTrialInCloud(
+  storeId: string,
+  additionalDays: number = 7
+): Promise<{ success: boolean; newExpiry?: string; error?: string }> {
+  try {
+    ensureFirebaseAuth();
+    const docRef = doc(db, STORES_COLLECTION, storeId);
+    const snap = await getDoc(docRef);
+    if (!snap.exists()) {
+      return { success: false, error: 'Store not found.' };
+    }
+    const store = snap.data() as StoreMeta;
+    const currentEnd = store.trialEndsAt ? new Date(store.trialEndsAt).getTime() : Date.now();
+    const baseTime = currentEnd > Date.now() ? currentEnd : Date.now();
+    const newExpiry = new Date(baseTime + additionalDays * 24 * 60 * 60 * 1000).toISOString();
+
+    await setDoc(
+      docRef,
+      sanitizePayload({
+        isTrial: true,
+        planType: 'trial',
+        trialEndsAt: newExpiry,
+        lastActive: new Date().toISOString(),
+      }),
+      { merge: true }
+    );
+
+    return { success: true, newExpiry };
+  } catch (err: unknown) {
+    return { success: false, error: (err as Error).message || 'Failed to extend trial.' };
   }
 }
 

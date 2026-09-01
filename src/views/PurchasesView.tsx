@@ -12,13 +12,17 @@ export const PurchasesView: React.FC = () => {
   const [qty, setQty] = useState<number>(1);
   const [cost, setCost] = useState<string>('');
   const [supplier, setSupplier] = useState('');
+  const [purchaseToDelete, setPurchaseToDelete] = useState<any | null>(null);
+  const [formError, setFormError] = useState<string>('');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setFormError('');
     const cleanName = itemName.trim();
     const costNum = parseFloat(cost);
     if (!cleanName || isNaN(costNum) || costNum < 0 || qty <= 0) {
-      return alert('Please provide product name, quantity received, and unit cost price.');
+      setFormError('Please provide product name, quantity received, and unit cost price.');
+      return;
     }
 
     const match = inventory.find((i) => i.name.toLowerCase() === cleanName.toLowerCase());
@@ -60,6 +64,13 @@ export const PurchasesView: React.FC = () => {
         </h2>
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {formError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-xs flex items-center justify-between animate-in fade-in">
+              <span>{formError}</span>
+              <button type="button" onClick={() => setFormError('')} className="text-rose-500 hover:text-rose-700 font-bold ml-2 cursor-pointer">&times;</button>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             <div>
               <label className="block text-[11px] font-bold uppercase text-slate-500 mb-1">Purchase Date</label>
@@ -203,12 +214,10 @@ export const PurchasesView: React.FC = () => {
                     </td>
                     <td className="px-4 py-3 text-center">
                       <button
-                        onClick={() => {
-                          if (window.confirm('Delete purchase record? Stock will be adjusted.')) {
-                            deletePurchase(p.id);
-                          }
-                        }}
-                        className="p-1.5 text-rose-600 hover:bg-rose-50 rounded-lg"
+                        type="button"
+                        onClick={() => setPurchaseToDelete(p)}
+                        className="p-1.5 text-rose-600 hover:bg-rose-50 rounded-lg cursor-pointer transition-colors"
+                        title="Delete Purchase"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -220,6 +229,60 @@ export const PurchasesView: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* In-App Delete Purchase Confirmation Modal */}
+      {purchaseToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4 text-left">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Delete Purchase Record</h3>
+                <p className="text-xs text-slate-500 font-mono">#{purchaseToDelete.id}</p>
+              </div>
+            </div>
+
+            <div className="p-3.5 bg-rose-50/70 rounded-xl border border-rose-200/80 text-xs text-rose-900 space-y-2">
+              <p className="font-semibold text-rose-800">
+                Are you sure you want to remove this purchase record for <b className="text-rose-950 font-bold">{purchaseToDelete.itemName}</b>?
+              </p>
+              <div className="bg-white p-2.5 rounded-lg border border-rose-200 space-y-1 font-mono text-[11px] text-slate-700">
+                <div>Date: {purchaseToDelete.date}</div>
+                <div>Quantity: <b>{purchaseToDelete.qty}</b></div>
+                <div>Cost: <b>{formatMoney(purchaseToDelete.cost, settings.currency)}</b></div>
+                <div>Total: <b>{formatMoney(purchaseToDelete.total, settings.currency)}</b></div>
+                {purchaseToDelete.supplier && <div>Supplier: {purchaseToDelete.supplier}</div>}
+              </div>
+              <p className="text-[11px] text-rose-700 leading-relaxed">
+                Inventory stock will be deducted by {purchaseToDelete.qty} unit(s).
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => setPurchaseToDelete(null)}
+                className="flex-1 py-2.5 px-4 rounded-xl border border-slate-200 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-all cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  deletePurchase(purchaseToDelete.id);
+                  setPurchaseToDelete(null);
+                }}
+                className="flex-1 py-2.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold shadow-sm transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Delete Purchase
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
